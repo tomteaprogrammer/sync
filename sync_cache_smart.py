@@ -15,6 +15,7 @@ import re
 import json
 import tempfile
 from pathlib import Path
+from datetime import datetime
 
 # --- LOGGING ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s: %(message)s', datefmt='%H:%M:%S')
@@ -50,6 +51,12 @@ def install_and_import(package):
         return None
 
 send2trash = install_and_import('send2trash')
+PIL = install_and_import('PIL')
+if PIL:
+    from PIL import Image, ImageTk
+fitz = install_and_import('pymupdf')
+if fitz is None:
+    fitz = install_and_import('fitz')
 
 def prepare_path(path):
     path = os.path.normpath(path)
@@ -120,6 +127,30 @@ def detect_optimal_threads():
         "recommended": recommended,
         "label": f"Auto ({recommended}) — {cpu_cores} cores, {drive_type}"
     }
+
+IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.tiff', '.ico'}
+VIDEO_EXTENSIONS = {'.mp4', '.avi', '.mkv', '.mov', '.wmv', '.flv', '.webm', '.m4v', '.mpg', '.mpeg'}
+
+def get_resolution(filepath):
+    ext = os.path.splitext(filepath)[1].lower()
+    if ext in IMAGE_EXTENSIONS and PIL:
+        try:
+            with Image.open(filepath) as img:
+                return f"{img.width}x{img.height}"
+        except Exception:
+            return ""
+    if ext in VIDEO_EXTENSIONS:
+        try:
+            result = subprocess.run(
+                ["ffprobe", "-v", "error", "-select_streams", "v:0",
+                 "-show_entries", "stream=width,height", "-of", "csv=p=0:s=x", filepath],
+                capture_output=True, text=True, timeout=5
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                return result.stdout.strip()
+        except Exception:
+            pass
+    return ""
 
 def format_size(size_bytes):
     """Human-readable file size."""
@@ -447,35 +478,64 @@ class App:
         self.tab_internal = tk.Frame(self.notebook)
         self.notebook.add(self.tab_internal, text="2. Internal Duplicates (Clean Single Folder)")
 
-        self.tree_internal = ttk.Treeview(
-            self.tab_internal,
-            columns=("name", "size", "folder", "path"),
-            show="tree headings",
-            selectmode="extended"  # Allow multi-select
-        )
-        self.tree_internal.heading("name", text="File Name")
-        self.tree_internal.heading("size", text="Size")
-        self.tree_internal.heading("folder", text="Folder")
-        self.tree_internal.heading("path", text="Full Path")
-        self.tree_internal.column("#0", width=30)
-        self.tree_internal.column("name", width=300)
-        self.tree_internal.column("size", width=80)
-        self.tree_internal.column("folder", width=250)
-        self.tree_internal.column("path", width=0, stretch=False)
-
-        # Scrollbar for internal tree
-        scroll_y = ttk.Scrollbar(self.tab_internal, orient="vertical", command=self.tree_internal.yview)
-        self.tree_internal.configure(yscrollcommand=scroll_y.set)
-        self.tree_internal.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scroll_y.pack(side=tk.RIGHT, fill=tk.Y)
-
-        self.tree_internal.bind("<Double-1>", self.on_double_click)
-
         f_int_act = tk.Frame(self.tab_internal, pady=5, bg="#e3f2fd")
         f_int_act.pack(fill=tk.X, side=tk.BOTTOM)
         tk.Button(f_int_act, text="Trash Selected", bg="#ffcdd2", command=self.delete_selected_internal).pack(side=tk.RIGHT, padx=5)
         tk.Button(f_int_act, text="Auto-Keep Best Path", bg="#bbdefb", command=self.auto_cull_internal).pack(side=tk.RIGHT, padx=5)
         tk.Button(f_int_act, text="Select All Except Best", bg="#c8e6c9", command=self.select_all_except_best).pack(side=tk.RIGHT, padx=5)
+
+        paned = ttk.PanedWindow(self.tab_internal, orient=tk.HORIZONTAL)
+        paned.pack(fill=tk.BOTH, expand=True)
+
+        # Left: tree
+        tree_frame = tk.Frame(paned)
+        self.tree_internal = ttk.Treeview(
+            tree_frame,
+            columns=("name", "size", "resolution", "folder", "path"),
+            show="tree headings",
+            selectmode="extended"
+        )
+        self.tree_internal.heading("name", text="File Name")
+        self.tree_internal.heading("size", text="Size")
+        self.tree_internal.heading("resolution", text="Resolution")
+        self.tree_internal.heading("folder", text="Folder")
+        self.tree_internal.heading("path", text="Full Path")
+        self.tree_internal.column("#0", width=30)
+        self.tree_internal.column("name", width=250)
+        self.tree_internal.column("size", width=80)
+        self.tree_internal.column("resolution", width=100)
+        self.tree_internal.column("folder", width=200)
+        self.tree_internal.column("path", width=0, stretch=False)
+
+        scroll_y = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree_internal.yview)
+        self.tree_internal.configure(yscrollcommand=scroll_y.set)
+        self.tree_internal.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scroll_y.pack(side=tk.RIGHT, fill=tk.Y)
+
+        self.tree_internal.bind("<Double-1>", self.on_double_click)
+        self.tree_internal.bind("<<TreeviewSelect>>", self._on_preview_select)
+
+        paned.add(tree_frame, weight=3)
+
+        # Right: preview
+        self.preview_frame = tk.LabelFrame(paned, text="Preview", padx=5, pady=5)
+        self.preview_image_label = tk.Label(self.preview_frame, text="Select a file to preview", fg="gray", bg="#f5f5f5")
+        self.preview_image_label.pack(fill=tk.BOTH, expand=True)
+
+        self.preview_info = tk.Label(self.preview_frame, text="", font=("Arial", 8), fg="#555", wraplength=350, justify=tk.LEFT)
+        self.preview_info.pack(fill=tk.X, pady=(5, 0))
+
+        self.preview_text = tk.Text(self.preview_frame, height=8, state=tk.DISABLED, bg="#fafafa", font=("Consolas", 9), wrap=tk.WORD)
+        self.preview_text.pack(fill=tk.BOTH, expand=True, pady=(5, 0))
+        self.preview_text.pack_forget()
+
+        self.btn_preview_open = tk.Button(self.preview_frame, text="Open File", command=self._open_preview_file, state=tk.DISABLED)
+        self.btn_preview_open.pack(pady=(5, 0))
+
+        self._preview_photo = None
+        self._preview_path = None
+
+        paned.add(self.preview_frame, weight=1)
 
         # Tab 3: Copy / Move
         self.tab_copy = tk.Frame(self.notebook)
@@ -871,6 +931,115 @@ class App:
         self.txt_log.delete("1.0", tk.END)
         self.txt_log.config(state=tk.DISABLED)
 
+    # --- PREVIEW ---
+    IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.tiff', '.ico'}
+    VIDEO_EXTS = {'.mp4', '.avi', '.mkv', '.mov', '.wmv', '.flv', '.webm', '.m4v', '.mpg', '.mpeg'}
+    TEXT_EXTS = {'.txt', '.csv', '.log', '.json', '.xml', '.html', '.htm', '.css', '.js',
+                 '.py', '.md', '.yml', '.yaml', '.ini', '.cfg', '.toml', '.php', '.tsx', '.ts'}
+
+    def _on_preview_select(self, event=None):
+        sel = self.tree_internal.selection()
+        if not sel:
+            return
+        vals = self.tree_internal.item(sel[0], "values")
+        path = vals[-1] if vals else ""
+        if not path or not os.path.isfile(path):
+            self._clear_preview()
+            return
+        self._preview_path = path
+        self.btn_preview_open.config(state=tk.NORMAL)
+
+        ext = os.path.splitext(path)[1].lower()
+        size = os.path.getsize(path)
+        modified = os.path.getmtime(path)
+        mod_str = datetime.fromtimestamp(modified).strftime('%Y-%m-%d %H:%M')
+        self.preview_info.config(text=f"{os.path.basename(path)}\n{format_size(size)}  |  {mod_str}\n{path}")
+
+        if ext in self.IMAGE_EXTS and PIL:
+            self._show_image_preview(path)
+        elif ext == '.pdf':
+            self._show_pdf_preview(path)
+        elif ext in self.VIDEO_EXTS:
+            self._show_video_preview(path)
+        elif ext in self.TEXT_EXTS:
+            self._show_text_preview(path)
+        else:
+            self._show_generic_preview(ext)
+
+    def _clear_preview(self):
+        self._preview_photo = None
+        self._preview_path = None
+        self.preview_text.pack_forget()
+        self.preview_image_label.pack(fill=tk.BOTH, expand=True)
+        self.preview_image_label.config(image='', text="Select a file to preview", fg="gray")
+        self.preview_info.config(text="")
+        self.btn_preview_open.config(state=tk.DISABLED)
+
+    def _show_image_preview(self, path):
+        self.preview_text.pack_forget()
+        self.preview_image_label.pack(fill=tk.BOTH, expand=True)
+        try:
+            img = Image.open(path)
+            img.thumbnail((400, 400), Image.LANCZOS)
+            self._preview_photo = ImageTk.PhotoImage(img)
+            self.preview_image_label.config(image=self._preview_photo, text="")
+        except Exception as e:
+            self.preview_image_label.config(image='', text=f"Could not load image:\n{e}", fg="red")
+
+    def _show_pdf_preview(self, path):
+        self.preview_text.pack_forget()
+        self.preview_image_label.pack(fill=tk.BOTH, expand=True)
+        if not fitz or not PIL:
+            self.preview_image_label.config(image='', text="PDF preview requires\npymupdf + Pillow\n\nUse 'Open File' to view", fg="gray")
+            return
+        try:
+            doc = fitz.open(path)
+            page = doc[0]
+            mat = fitz.Matrix(2, 2)
+            pix = page.get_pixmap(matrix=mat)
+            img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+            doc.close()
+            img.thumbnail((400, 500), Image.LANCZOS)
+            self._preview_photo = ImageTk.PhotoImage(img)
+            self.preview_image_label.config(image=self._preview_photo, text="")
+        except Exception as e:
+            self.preview_image_label.config(image='', text=f"Could not render PDF:\n{e}", fg="red")
+
+    def _show_video_preview(self, path):
+        self.preview_text.pack_forget()
+        self.preview_image_label.pack(fill=tk.BOTH, expand=True)
+        self.preview_image_label.config(image='', text="VIDEO FILE\n\nDouble-click or use\n'Open File' to play", fg="#1976d2")
+
+    def _show_text_preview(self, path):
+        self.preview_image_label.config(image='', text="")
+        self.preview_text.pack(fill=tk.BOTH, expand=True, pady=(5, 0))
+        try:
+            with open(path, 'r', encoding='utf-8', errors='replace') as f:
+                content = f.read(4096)
+            self.preview_text.config(state=tk.NORMAL)
+            self.preview_text.delete("1.0", tk.END)
+            self.preview_text.insert("1.0", content)
+            self.preview_text.config(state=tk.DISABLED)
+            self.preview_image_label.pack_forget()
+        except Exception:
+            self.preview_image_label.config(text="Could not read file", fg="red")
+            self.preview_image_label.pack(fill=tk.BOTH, expand=True)
+            self.preview_text.pack_forget()
+
+    def _show_generic_preview(self, ext):
+        self.preview_text.pack_forget()
+        self.preview_image_label.pack(fill=tk.BOTH, expand=True)
+        self.preview_image_label.config(image='', text=f"No preview available\nfor {ext} files\n\nDouble-click or use\n'Open File' to view", fg="gray")
+
+    def _open_preview_file(self):
+        if self._preview_path and os.path.exists(self._preview_path):
+            if platform.system() == 'Windows':
+                os.startfile(self._preview_path)
+            elif platform.system() == 'Darwin':
+                subprocess.call(['open', self._preview_path])
+            else:
+                subprocess.call(['xdg-open', self._preview_path])
+
     # --- EMPTY FOLDER REMOVER ---
     def scan_empty_folders(self):
         folder = self.ent_empty_path.get().strip()
@@ -1186,6 +1355,7 @@ WScript.Sleep 2000
                 f"[GROUP] {len(group)} copies",
                 group_size,
                 "",
+                "",
                 ""
             ), open=True)
 
@@ -1202,9 +1372,11 @@ WScript.Sleep 2000
                 else:
                     tag = "dupe"
                     prefix = ""
+                res = get_resolution(path)
                 self.tree_internal.insert(grp_id, "end", values=(
                     prefix + os.path.basename(path),
                     format_size(size),
+                    res,
                     os.path.basename(os.path.dirname(path)),
                     path
                 ), tags=(tag,))
