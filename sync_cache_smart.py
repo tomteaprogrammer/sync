@@ -101,14 +101,38 @@ def prepare_path(path):
         path = '\\\\?\\' + path
     return path
 
+def _norm_for_compare(p):
+    """Normalize a path for case/format-tolerant comparison."""
+    p = str(p)
+    # Strip Windows long-path prefix so prefixed/non-prefixed paths compare equal
+    if p.startswith('\\\\?\\'):
+        p = p[4:]
+    try:
+        p = os.path.normpath(os.path.abspath(p))
+    except Exception:
+        pass
+    # Windows file system is case-insensitive
+    if platform.system() == 'Windows':
+        p = p.lower()
+    # Strip any trailing separator so 'D:\foo' and 'D:\foo\' compare equal
+    p = p.rstrip(os.sep).rstrip('/')
+    return p
+
 def is_subpath(path, parent):
+    r"""True if 'path' is the same as, or nested inside, 'parent'.
+    Case-insensitive on Windows. Tolerates the \\?\ long-path prefix.
+    Uses a trailing-separator check so 'D:\foo' does NOT match 'D:\foobar'."""
     if not parent:
         return False
     try:
-        path = os.path.abspath(path)
-        parent = os.path.abspath(parent)
-        return os.path.commonpath([parent, path]) == parent
-    except ValueError:
+        path = _norm_for_compare(path)
+        parent = _norm_for_compare(parent)
+        if not parent:
+            return False
+        if path == parent:
+            return True
+        return path.startswith(parent + os.sep)
+    except Exception:
         return False
 
 def reveal_in_explorer(path):

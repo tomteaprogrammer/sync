@@ -101,14 +101,38 @@ def prepare_path(path):
         path = '\\\\?\\' + path
     return path
 
+def _norm_for_compare(p):
+    """Normalize a path for case/format-tolerant comparison."""
+    p = str(p)
+    # Strip Windows long-path prefix so prefixed/non-prefixed paths compare equal
+    if p.startswith('\\\\?\\'):
+        p = p[4:]
+    try:
+        p = os.path.normpath(os.path.abspath(p))
+    except Exception:
+        pass
+    # Windows file system is case-insensitive
+    if platform.system() == 'Windows':
+        p = p.lower()
+    # Strip any trailing separator so 'D:\foo' and 'D:\foo\' compare equal
+    p = p.rstrip(os.sep).rstrip('/')
+    return p
+
 def is_subpath(path, parent):
+    r"""True if 'path' is the same as, or nested inside, 'parent'.
+    Case-insensitive on Windows. Tolerates the \\?\ long-path prefix.
+    Uses a trailing-separator check so 'D:\foo' does NOT match 'D:\foobar'."""
     if not parent:
         return False
     try:
-        path = os.path.abspath(path)
-        parent = os.path.abspath(parent)
-        return os.path.commonpath([parent, path]) == parent
-    except ValueError:
+        path = _norm_for_compare(path)
+        parent = _norm_for_compare(parent)
+        if not parent:
+            return False
+        if path == parent:
+            return True
+        return path.startswith(parent + os.sep)
+    except Exception:
         return False
 
 def reveal_in_explorer(path):
@@ -167,15 +191,28 @@ def detect_optimal_threads():
 IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.tiff', '.ico'}
 VIDEO_EXTENSIONS = {'.mp4', '.avi', '.mkv', '.mov', '.wmv', '.flv', '.webm', '.m4v', '.mpg', '.mpeg'}
 
+# Check once at import time so we don't pay subprocess overhead per call
+HAS_FFPROBE = shutil.which("ffprobe") is not None
+
+# Cache resolutions so re-populating the tree (after a delete) doesn't re-fetch
+_RESOLUTION_CACHE = {}
+
 def get_resolution(filepath):
+    """Return 'WxH' for an image or video, or '' if unknown. Cached.
+    Image lookups use PIL (fast). Video lookups use ffprobe (slow — only if installed)."""
+    cached = _RESOLUTION_CACHE.get(filepath)
+    if cached is not None:
+        return cached
+
     ext = os.path.splitext(filepath)[1].lower()
+    res = ""
     if ext in IMAGE_EXTENSIONS and PIL:
         try:
             with Image.open(filepath) as img:
-                return f"{img.width}x{img.height}"
+                res = f"{img.width}x{img.height}"
         except Exception:
-            return ""
-    if ext in VIDEO_EXTENSIONS:
+            res = ""
+    elif ext in VIDEO_EXTENSIONS and HAS_FFPROBE:
         try:
             result = subprocess.run(
                 ["ffprobe", "-v", "error", "-select_streams", "v:0",
@@ -183,10 +220,12 @@ def get_resolution(filepath):
                 capture_output=True, text=True, timeout=5
             )
             if result.returncode == 0 and result.stdout.strip():
-                return result.stdout.strip()
+                res = result.stdout.strip()
         except Exception:
-            pass
-    return ""
+            res = ""
+
+    _RESOLUTION_CACHE[filepath] = res
+    return res
 
 def format_size(size_bytes):
     """Human-readable file size."""
@@ -384,26 +423,36 @@ class Comparator(threading.Thread):
         return new_indices
 
     def run(self):
-        target_idx = self.process_folder_parallel(self.target, "Target")
-        if self.stop_event.is_set():
-            return
-
-        master_idx = {}
-        if self.master:
-            master_idx = self.process_folder_parallel(self.master, "Master")
+        try:
+            target_idx = self.process_folder_parallel(self.target, "Target")
             if self.stop_event.is_set():
+                self.finish({}, {})
                 return
 
-        # Smart mode: verify partial-hash matches with full hash
-        if self.scan_mode == SCAN_SMART:
-            self.update_ui("Verifying matches with full hash...", 0)
+            master_idx = {}
             if self.master:
-                master_idx, target_idx = self.verify_with_full_hash([master_idx, target_idx])
-            else:
-                target_idx, = self.verify_with_full_hash([target_idx])
+                master_idx = self.process_folder_parallel(self.master, "Master")
+                if self.stop_event.is_set():
+                    self.finish({}, {})
+                    return
 
-        self.update_ui("Finishing...", 100)
-        self.finish(master_idx, target_idx)
+            # Smart mode: verify partial-hash matches with full hash
+            if self.scan_mode == SCAN_SMART:
+                self.update_ui("Verifying matches with full hash...", 0)
+                if self.master:
+                    master_idx, target_idx = self.verify_with_full_hash([master_idx, target_idx])
+                else:
+                    target_idx, = self.verify_with_full_hash([target_idx])
+
+            self.update_ui("Finishing...", 100)
+            self.finish(master_idx, target_idx)
+        except Exception as e:
+            log.error(f"Scan failed: {e}", exc_info=True)
+            # alert_user shows the warning AND re-enables btn_scan; that's all we need.
+            try:
+                self.alert("Scan Error", f"Scan failed:\n{e}")
+            except Exception:
+                pass
 
 
 # --- 4. GUI APPLICATION ---
@@ -925,52 +974,67 @@ class App:
 
     def _run_python_copy(self, src, dst, move, action, threads):
         log.info(f"Python {action}: {src} → {dst} ({threads} threads)")
-        self.root.after(0, self._append_copy_log, "Listing files...\n")
-        file_pairs = []
-        for root, dirs, files in os.walk(src):
-            rel = os.path.relpath(root, src)
-            dest_dir = os.path.join(dst, rel)
-            for f in files:
-                file_pairs.append((os.path.join(root, f), os.path.join(dest_dir, f), move))
-
-        total = len(file_pairs)
         copied = 0
         failed = 0
-        workers = min(threads, total) if total > 0 else 1
-        self.root.after(0, self._append_copy_log, f"Found {total} files. {action} with {workers} threads...\n\n")
-        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
-            futures = {executor.submit(self._copy_single_file, pair): pair for pair in file_pairs}
-            for future in concurrent.futures.as_completed(futures):
-                if self.copy_stop_event.is_set():
-                    executor.shutdown(wait=False, cancel_futures=True)
-                    self.root.after(0, self._append_copy_log, f"\n--- CANCELLED after {copied} files ---\n")
-                    self.root.after(0, self._copy_finished, f"Cancelled. {copied} files copied before stop.", "red")
-                    return
+        total = 0
+        cancelled = False
+        msg = ""
+        color = "red"
+        try:
+            self.root.after(0, self._append_copy_log, "Listing files...\n")
+            file_pairs = []
+            for root, dirs, files in os.walk(src):
+                rel = os.path.relpath(root, src)
+                dest_dir = os.path.join(dst, rel)
+                for f in files:
+                    file_pairs.append((os.path.join(root, f), os.path.join(dest_dir, f), move))
 
-                path, success, err = future.result()
-                if success:
-                    copied += 1
-                else:
-                    failed += 1
-                    self.root.after(0, self._append_copy_log, f"FAILED: {path} — {err}\n")
+            total = len(file_pairs)
+            workers = min(threads, total) if total > 0 else 1
+            self.root.after(0, self._append_copy_log, f"Found {total} files. {action} with {workers} threads...\n\n")
+            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+                futures = {executor.submit(self._copy_single_file, pair): pair for pair in file_pairs}
+                for future in concurrent.futures.as_completed(futures):
+                    if self.copy_stop_event.is_set():
+                        executor.shutdown(wait=False, cancel_futures=True)
+                        cancelled = True
+                        break
 
-                if copied % 100 == 0 and copied > 0:
-                    self.root.after(0, self._append_copy_log, f"{action}: {copied}/{total} files...\n")
+                    path, success, err = future.result()
+                    if success:
+                        copied += 1
+                    else:
+                        failed += 1
+                        self.root.after(0, self._append_copy_log, f"FAILED: {path} — {err}\n")
 
-        if move and not self.copy_stop_event.is_set():
-            for root, dirs, files in os.walk(src, topdown=False):
-                try:
-                    if not os.listdir(root):
-                        os.rmdir(root)
-                except Exception:
-                    pass
+                    if copied % 100 == 0 and copied > 0:
+                        self.root.after(0, self._append_copy_log, f"{action}: {copied}/{total} files...\n")
 
-        msg = f"{action} complete. {copied}/{total} files."
-        if failed:
-            msg += f" {failed} failed."
-        color = "green" if failed == 0 else "orange"
-        self.root.after(0, self._append_copy_log, f"\n{msg}\n")
-        self.root.after(0, self._copy_finished, msg, color)
+            if cancelled:
+                self.root.after(0, self._append_copy_log, f"\n--- CANCELLED after {copied} files ---\n")
+                msg = f"Cancelled. {copied} files copied before stop."
+                color = "red"
+            else:
+                if move:
+                    for root, dirs, files in os.walk(src, topdown=False):
+                        try:
+                            if not os.listdir(root):
+                                os.rmdir(root)
+                        except Exception:
+                            pass
+                msg = f"{action} complete. {copied}/{total} files."
+                if failed:
+                    msg += f" {failed} failed."
+                color = "green" if failed == 0 else "orange"
+                self.root.after(0, self._append_copy_log, f"\n{msg}\n")
+        except Exception as e:
+            log.error(f"Python copy failed: {e}", exc_info=True)
+            msg = f"Error: {e}"
+            color = "red"
+            self.root.after(0, self._append_copy_log, f"\nERROR: {e}\n")
+        finally:
+            # Always release the UI no matter what happened above
+            self.root.after(0, self._copy_finished, msg or "Done.", color)
 
     def _append_copy_log(self, line):
         self.txt_copy_log.config(state=tk.NORMAL)
@@ -1070,18 +1134,25 @@ class App:
         if not fitz or not PIL:
             self.preview_image_label.config(image='', text="PDF preview requires\npymupdf + Pillow\n\nUse 'Open File' to view", fg="gray")
             return
+        doc = None
         try:
             doc = fitz.open(path)
             page = doc[0]
             mat = fitz.Matrix(2, 2)
             pix = page.get_pixmap(matrix=mat)
             img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-            doc.close()
             img.thumbnail((400, 500), Image.LANCZOS)
             self._preview_photo = ImageTk.PhotoImage(img)
             self.preview_image_label.config(image=self._preview_photo, text="")
         except Exception as e:
             self.preview_image_label.config(image='', text=f"Could not render PDF:\n{e}", fg="red")
+        finally:
+            # Always close the PDF handle, even on error
+            if doc is not None:
+                try:
+                    doc.close()
+                except Exception:
+                    pass
 
     def _show_video_preview(self, path):
         self.preview_text.pack_forget()
@@ -1131,21 +1202,44 @@ class App:
         self.lbl_empty_stat.config(text="Scanning...", fg="blue")
 
         def run():
+            # A folder counts as "empty" if it contains no files AND all of its
+            # subdirectories are themselves empty (recursively). Bottom-up walk
+            # lets us decide each level using the results from the levels below.
+            empty_set = set()
             empty_dirs = []
-            for dirpath, dirnames, filenames in os.walk(folder, topdown=False):
-                if dirpath == folder:
-                    continue
-                try:
-                    if not os.listdir(dirpath):
-                        empty_dirs.append(dirpath)
-                except Exception:
-                    pass
+            error = None
+            try:
+                for dirpath, dirnames, filenames in os.walk(folder, topdown=False):
+                    if dirpath == folder:
+                        continue
+                    try:
+                        if filenames:
+                            continue  # has at least one file → not empty
+                        # All subdirs must already be in empty_set for this dir to count
+                        all_subs_empty = True
+                        for d in dirnames:
+                            sub = os.path.join(dirpath, d)
+                            if sub not in empty_set:
+                                all_subs_empty = False
+                                break
+                        if all_subs_empty:
+                            empty_set.add(dirpath)
+                            empty_dirs.append(dirpath)
+                    except Exception:
+                        pass
+            except Exception as e:
+                error = e
+                log.error(f"Empty folder scan crashed: {e}", exc_info=True)
 
             def populate():
                 for d in sorted(empty_dirs):
                     self.tree_empty.insert("", "end", values=(d,))
                 count = len(empty_dirs)
-                self.lbl_empty_stat.config(text=f"Found {count} empty folder(s).", fg="green" if count == 0 else "#d32f2f")
+                if error:
+                    self.lbl_empty_stat.config(text=f"Scan error: {error}", fg="red")
+                else:
+                    self.lbl_empty_stat.config(text=f"Found {count} empty folder(s).",
+                                               fg="green" if count == 0 else "#d32f2f")
                 self.btn_empty_scan.config(state=tk.NORMAL)
                 self.btn_empty_delete.config(state=tk.NORMAL if count > 0 else tk.DISABLED)
                 self.btn_empty_select_all.config(state=tk.NORMAL if count > 0 else tk.DISABLED)
@@ -1168,10 +1262,18 @@ class App:
         if not messagebox.askyesno("Confirm", f"Permanently delete {len(sel)} empty folder(s)?"):
             return
 
-        removed = 0
-        failed = 0
+        # Sort deepest-first so a chain like A\B\C\D can be removed in one click:
+        # rmdir(D), then rmdir(C), then rmdir(B), then rmdir(A) all succeed.
+        # If we deleted shallow-first, A would still contain B and rmdir(A) would fail.
+        entries = []
         for item_id in sel:
             path = self.tree_empty.item(item_id, "values")[0]
+            entries.append((item_id, path))
+        entries.sort(key=lambda e: e[1].count(os.sep), reverse=True)
+
+        removed = 0
+        failed = 0
+        for item_id, path in entries:
             try:
                 os.rmdir(path)
                 self.tree_empty.delete(item_id)
@@ -1263,40 +1365,49 @@ WScript.Sleep 2000
 
     def _run_unzip(self, zips, overwrite, subfolder, engine):
         log.info(f"Unzip started — {len(zips)} files, engine={engine}, overwrite={overwrite}, subfolder={subfolder}")
-
-        if engine.startswith("Windows tar"):
-            unzip_fn = self._unzip_tar
-        else:
-            unzip_fn = self._unzip_explorer
-
         success = 0
         failed = 0
-        for zip_path in zips:
-            zp = Path(zip_path)
-            if subfolder:
-                extract_to = zp.parent / zp.stem
+        msg = "Done."
+        color = "gray"
+        try:
+            if engine.startswith("Windows tar"):
+                unzip_fn = self._unzip_tar
             else:
-                extract_to = zp.parent
+                unzip_fn = self._unzip_explorer
 
-            self.root.after(0, self._append_unzip_log, f"Unzipping: {zp.name} → {extract_to}\n")
+            for zip_path in zips:
+                zp = Path(zip_path)
+                if subfolder:
+                    extract_to = zp.parent / zp.stem
+                else:
+                    extract_to = zp.parent
 
-            try:
-                unzip_fn(zp, extract_to, overwrite)
-                self.root.after(0, self._append_unzip_log, f"  OK\n")
-                success += 1
-            except Exception as e:
-                self.root.after(0, self._append_unzip_log, f"  FAILED: {e}\n")
-                log.warning(f"Unzip failed for {zp.name}: {e}")
-                failed += 1
+                self.root.after(0, self._append_unzip_log, f"Unzipping: {zp.name} → {extract_to}\n")
 
-        msg = f"Done. {success} extracted."
-        if failed:
-            msg += f" {failed} failed."
-        color = "green" if failed == 0 else "orange"
-        log.info(f"Unzip complete — {success} OK, {failed} failed")
-        self.root.after(0, self._append_unzip_log, f"\n{msg}\n")
-        self.root.after(0, self.lbl_unzip_stat.config, {"text": msg, "fg": color})
-        self.root.after(0, self.btn_unzip_start.config, {"state": tk.NORMAL})
+                try:
+                    unzip_fn(zp, extract_to, overwrite)
+                    self.root.after(0, self._append_unzip_log, f"  OK\n")
+                    success += 1
+                except Exception as e:
+                    self.root.after(0, self._append_unzip_log, f"  FAILED: {e}\n")
+                    log.warning(f"Unzip failed for {zp.name}: {e}")
+                    failed += 1
+
+            msg = f"Done. {success} extracted."
+            if failed:
+                msg += f" {failed} failed."
+            color = "green" if failed == 0 else "orange"
+            log.info(f"Unzip complete — {success} OK, {failed} failed")
+            self.root.after(0, self._append_unzip_log, f"\n{msg}\n")
+        except Exception as e:
+            log.error(f"Unzip job failed: {e}", exc_info=True)
+            msg = f"Unzip job error: {e}"
+            color = "red"
+            self.root.after(0, self._append_unzip_log, f"\nERROR: {e}\n")
+        finally:
+            # Always release the UI no matter what happened above
+            self.root.after(0, self.lbl_unzip_stat.config, {"text": msg, "fg": color})
+            self.root.after(0, self.btn_unzip_start.config, {"state": tk.NORMAL})
 
     def add_protected(self):
         d = filedialog.askdirectory(title="Select folder to protect")
@@ -1422,6 +1533,7 @@ WScript.Sleep 2000
 
     def populate_trees(self):
         self.clear_trees()
+        pending = []  # (tree, item_id, path) — resolutions filled in by background thread
 
         if self.mode.get() == 1:
             for d in self.cross_dupes:
@@ -1457,30 +1569,72 @@ WScript.Sleep 2000
                 else:
                     tag = "dupe"
                     prefix = ""
-                res = get_resolution(path)
-                self.tree_internal.insert(grp_id, "end", values=(
+                # Use cached resolution if available, else "" (filled in by background thread)
+                res = _RESOLUTION_CACHE.get(path, "")
+                item_id = self.tree_internal.insert(grp_id, "end", values=(
                     prefix + os.path.basename(path),
                     format_size(size),
                     res,
                     os.path.basename(os.path.dirname(path)),
                     path
                 ), tags=(tag,))
+                if not res:
+                    pending.append((self.tree_internal, item_id, path))
 
         # Color the keeper vs dupes vs protected
         self.tree_internal.tag_configure("protected", foreground="#d32f2f", font=("Arial", 9, "bold"))
         self.tree_internal.tag_configure("keeper", foreground="#2e7d32")
         self.tree_internal.tag_configure("dupe", foreground="#666666")
 
-        self.populate_only_tree()
+        pending.extend(self.populate_only_tree())
+
+        if pending:
+            self._start_resolution_lookup(pending)
+
+    def _start_resolution_lookup(self, items):
+        """Compute resolutions in a background thread and patch them into the
+        relevant tree rows. Keeps the GUI responsive when many videos are listed."""
+        # Snapshot a token so stale background updates from a previous scan get ignored
+        self._resolution_token = getattr(self, "_resolution_token", 0) + 1
+        my_token = self._resolution_token
+
+        def _worker():
+            try:
+                for tree, item_id, path in items:
+                    if my_token != self._resolution_token:
+                        return  # a new scan started; abandon stale updates
+                    res = get_resolution(path)
+                    if res:
+                        self.root.after(0, self._apply_resolution, tree, item_id, res, my_token)
+            except Exception as e:
+                log.warning(f"Resolution lookup worker error: {e}")
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _apply_resolution(self, tree, item_id, res, token):
+        """Patch a single tree row's resolution column (column index 2)."""
+        if token != getattr(self, "_resolution_token", 0):
+            return
+        try:
+            if not tree.exists(item_id):
+                return
+            vals = list(tree.item(item_id, "values"))
+            if len(vals) >= 3:
+                vals[2] = res
+                tree.item(item_id, values=vals)
+        except Exception:
+            pass
 
     def populate_only_tree(self):
-        """Fill the 'Only in Target' tab, grouping unique files by their parent folder."""
+        """Fill the 'Only in Target' tab, grouping unique files by their parent folder.
+        Returns a list of (tree, item_id, path) entries whose resolution still needs
+        to be looked up (so populate_trees can dispatch them in the background)."""
         for x in self.tree_only.get_children():
             self.tree_only.delete(x)
 
         if not self.only_in_target:
-            return
+            return []
 
+        pending = []
         # Group by parent folder
         by_folder = {}
         for path, size in self.only_in_target:
@@ -1498,13 +1652,17 @@ WScript.Sleep 2000
                 ""
             ), open=True, tags=("folderhdr",))
             for path, size in files:
-                self.tree_only.insert(grp_id, "end", values=(
+                res = _RESOLUTION_CACHE.get(path, "")
+                item_id = self.tree_only.insert(grp_id, "end", values=(
                     os.path.basename(path),
                     format_size(size),
-                    get_resolution(path),
+                    res,
                     os.path.basename(os.path.dirname(path)),
                     path
                 ))
+                if not res:
+                    pending.append((self.tree_only, item_id, path))
+        return pending
 
     def export_only_in_target(self):
         """Write the 'Only in Target' list to a text file."""
@@ -1557,8 +1715,16 @@ WScript.Sleep 2000
                 f"structure is recreated under master."):
             return
 
-        target_root = os.path.abspath(self.target_path)
-        master_root = os.path.abspath(self.master_path)
+        def _strip_lp(p):
+            r"""Strip Windows long-path prefix so paths from prepare_path()
+            (which may add \\?\) can be compared with the user-typed root."""
+            p = str(p)
+            if p.startswith('\\\\?\\'):
+                p = p[4:]
+            return p
+
+        target_root = os.path.abspath(_strip_lp(self.target_path))
+        master_root = os.path.abspath(_strip_lp(self.master_path))
         files = list(self.only_in_target)
 
         self.btn_scan.config(state=tk.DISABLED)
@@ -1568,39 +1734,49 @@ WScript.Sleep 2000
         def _worker():
             copied = 0
             failed = 0
-            for i, (path, size) in enumerate(files):
-                try:
-                    src = os.path.abspath(path)
-                    # Mirror the relative path from target root; fall back to basename
+            try:
+                for i, (path, size) in enumerate(files):
                     try:
-                        rel = os.path.relpath(src, target_root)
-                        if rel.startswith(".."):
-                            rel = os.path.basename(src)
-                    except ValueError:
-                        rel = os.path.basename(src)
-                    dst = os.path.join(master_root, rel)
+                        # Strip long-path prefix from both src and root before relpath,
+                        # otherwise relpath raises ValueError ("paths on different mounts")
+                        src_norm = os.path.abspath(_strip_lp(path))
+                        try:
+                            rel = os.path.relpath(src_norm, target_root)
+                            if rel.startswith("..") or os.path.isabs(rel):
+                                rel = os.path.basename(src_norm)
+                        except ValueError:
+                            rel = os.path.basename(src_norm)
+                        dst = os.path.join(master_root, rel)
+                        # Use the original (possibly prefixed) path for the actual copy
+                        # so very deep paths still work on Windows
+                        src = path
 
-                    # Avoid clobbering a different file already at that path
-                    if os.path.exists(dst):
-                        base, ext = os.path.splitext(dst)
-                        n = 1
-                        while os.path.exists(f"{base} (from target {n}){ext}"):
-                            n += 1
-                        dst = f"{base} (from target {n}){ext}"
+                        # Avoid clobbering a different file already at that path
+                        if os.path.exists(dst):
+                            base, ext = os.path.splitext(dst)
+                            n = 1
+                            while os.path.exists(f"{base} (from target {n}){ext}"):
+                                n += 1
+                            dst = f"{base} (from target {n}){ext}"
 
-                    os.makedirs(os.path.dirname(dst), exist_ok=True)
-                    shutil.copy2(src, dst)
-                    copied += 1
-                except Exception as e:
-                    log.warning(f"Could not copy {path} to master: {e}")
-                    failed += 1
+                        # Re-add long-path prefix on Windows if the final path exceeds 259 chars
+                        dst_full = prepare_path(dst)
+                        os.makedirs(os.path.dirname(dst_full), exist_ok=True)
+                        shutil.copy2(src, dst_full)
+                        copied += 1
+                    except Exception as e:
+                        log.warning(f"Could not copy {path} to master: {e}")
+                        failed += 1
 
-                if (i + 1) % 25 == 0 or (i + 1) == total:
-                    done = i + 1
-                    self.root.after(0, lambda d=done: self.lbl_stat.config(
-                        text=f"Copying to master... {d}/{total}"))
-
-            self.root.after(0, _done, copied, failed)
+                    if (i + 1) % 25 == 0 or (i + 1) == total:
+                        done = i + 1
+                        self.root.after(0, lambda d=done: self.lbl_stat.config(
+                            text=f"Copying to master... {d}/{total}"))
+            except Exception as e:
+                log.error(f"Sync to master crashed: {e}", exc_info=True)
+            finally:
+                # Always re-enable buttons even if the loop crashed
+                self.root.after(0, _done, copied, failed)
 
         def _done(copied, failed):
             msg = f"Copied {copied} file(s) to master."
@@ -1727,10 +1903,25 @@ WScript.Sleep 2000
         def _worker():
             trashed = 0
             failed = 0
-            batch = []
-            for path in paths:
-                batch.append(path)
-                if len(batch) >= 50:
+            try:
+                batch = []
+                for path in paths:
+                    batch.append(path)
+                    if len(batch) >= 50:
+                        try:
+                            send2trash.send2trash(batch)
+                            trashed += len(batch)
+                        except Exception:
+                            for p in batch:
+                                try:
+                                    send2trash.send2trash(p)
+                                    trashed += 1
+                                except Exception as e:
+                                    log.warning(f"Could not trash {p}: {e}")
+                                    failed += 1
+                        batch = []
+                        self.root.after(0, lambda t=trashed: self.lbl_stat.config(text=f"Trashing... {t}/{len(paths)}"))
+                if batch:
                     try:
                         send2trash.send2trash(batch)
                         trashed += len(batch)
@@ -1742,21 +1933,11 @@ WScript.Sleep 2000
                             except Exception as e:
                                 log.warning(f"Could not trash {p}: {e}")
                                 failed += 1
-                    batch = []
-                    self.root.after(0, lambda t=trashed: self.lbl_stat.config(text=f"Trashing... {t}/{len(paths)}"))
-            if batch:
-                try:
-                    send2trash.send2trash(batch)
-                    trashed += len(batch)
-                except Exception:
-                    for p in batch:
-                        try:
-                            send2trash.send2trash(p)
-                            trashed += 1
-                        except Exception as e:
-                            log.warning(f"Could not trash {p}: {e}")
-                            failed += 1
-            self.root.after(0, on_done, trashed, failed)
+            except Exception as e:
+                log.error(f"Trash worker crashed: {e}", exc_info=True)
+            finally:
+                # Always invoke on_done so the UI re-enables itself
+                self.root.after(0, on_done, trashed, failed)
         threading.Thread(target=_worker, daemon=True).start()
 
     def trash_cross(self):
