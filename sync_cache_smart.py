@@ -12,10 +12,29 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 import concurrent.futures
 import re
+import json
+import tempfile
+from pathlib import Path
 
 # --- LOGGING ---
-logging.basicConfig(level=logging.WARNING, format='%(levelname)s: %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s: %(message)s', datefmt='%H:%M:%S')
 log = logging.getLogger(__name__)
+
+class TextHandler(logging.Handler):
+    def __init__(self, text_widget, root):
+        super().__init__()
+        self.text_widget = text_widget
+        self.root = root
+
+    def emit(self, record):
+        msg = self.format(record) + "\n"
+        self.root.after(0, self._append, msg)
+
+    def _append(self, msg):
+        self.text_widget.config(state=tk.NORMAL)
+        self.text_widget.insert(tk.END, msg)
+        self.text_widget.see(tk.END)
+        self.text_widget.config(state=tk.DISABLED)
 
 # --- 1. SETUP & UTILS ---
 def install_and_import(package):
@@ -61,14 +80,46 @@ def reveal_in_explorer(path):
     except Exception as e:
         log.warning(f"Could not open explorer for {path}: {e}")
 
-def get_free_space_gb(folder):
-    try:
-        if not folder or not os.path.exists(folder):
-            return 100
-        total, used, free = shutil.disk_usage(folder)
-        return free / (1024**3)
-    except Exception:
-        return 100
+def detect_optimal_threads():
+    """Analyze CPU cores and drive type to recommend max copy threads."""
+    cpu_cores = os.cpu_count() or 4
+    drive_type = "Unknown"
+    recommended = cpu_cores * 4
+
+    if platform.system() == "Windows":
+        try:
+            result = subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 "Get-PhysicalDisk | Select-Object MediaType,BusType | ConvertTo-Json"],
+                capture_output=True, text=True, timeout=10
+            )
+            if result.returncode == 0:
+                disks = json.loads(result.stdout)
+                if not isinstance(disks, list):
+                    disks = [disks]
+                for disk in disks:
+                    media = str(disk.get("MediaType", "")).lower()
+                    bus = str(disk.get("BusType", "")).lower()
+                    if "nvme" in bus or "nvme" in media:
+                        drive_type = "NVMe SSD"
+                        recommended = 128
+                        break
+                    elif "ssd" in media or "solid" in media:
+                        drive_type = "SATA SSD"
+                        recommended = 64
+                        break
+                    elif "hdd" in media or "unspecified" in media:
+                        drive_type = "HDD"
+                        recommended = min(16, cpu_cores * 2)
+        except Exception:
+            pass
+
+    return {
+        "cpu_cores": cpu_cores,
+        "drive_type": drive_type,
+        "recommended": recommended,
+        "label": f"Auto ({recommended}) — {cpu_cores} cores, {drive_type}"
+    }
 
 def format_size(size_bytes):
     """Human-readable file size."""
@@ -185,14 +236,6 @@ class Comparator(threading.Thread):
             for i, future in enumerate(concurrent.futures.as_completed(future_to_file)):
                 if self.stop_event.is_set():
                     break
-
-                # Check disk space every 50 files
-                if i % 50 == 0:
-                    free_gb = get_free_space_gb(folder)
-                    if free_gb < 5.0:
-                        self.stop_event.set()
-                        self.alert("CRITICAL WARNING", f"Disk Space Low! ({free_gb:.2f} GB left).\nStopping scan.")
-                        return {}
 
                 path, ident, size = future.result()
                 if ident:
@@ -378,8 +421,6 @@ class App:
         self.btn_scan.pack(side=tk.RIGHT)
 
         # STATUS
-        self.lbl_space = tk.Label(root, text="Disk Guard Active (<5GB Stops Scan)", fg="green", font=("Arial", 8))
-        self.lbl_space.pack()
         self.progress = ttk.Progressbar(root, mode='determinate')
         self.progress.pack(fill=tk.X, padx=10, pady=5)
         self.lbl_stat = tk.Label(root, text="Select folders or Load Cache.", fg="gray")
@@ -436,6 +477,177 @@ class App:
         tk.Button(f_int_act, text="Auto-Keep Best Path", bg="#bbdefb", command=self.auto_cull_internal).pack(side=tk.RIGHT, padx=5)
         tk.Button(f_int_act, text="Select All Except Best", bg="#c8e6c9", command=self.select_all_except_best).pack(side=tk.RIGHT, padx=5)
 
+        # Tab 3: Copy / Move
+        self.tab_copy = tk.Frame(self.notebook)
+        self.notebook.add(self.tab_copy, text="3. Copy / Move Folder")
+
+        frame_copy = tk.LabelFrame(self.tab_copy, text="Robocopy Folder Transfer", padx=15, pady=15)
+        frame_copy.pack(fill=tk.X, padx=10, pady=10)
+
+        tk.Label(frame_copy, text="Source Folder:", font=("Arial", 9, "bold")).grid(row=0, column=0, sticky="w")
+        self.ent_copy_src = tk.Entry(frame_copy, width=70)
+        self.ent_copy_src.grid(row=0, column=1, padx=5, pady=5)
+        tk.Button(frame_copy, text="Browse...", command=lambda: self.browse(self.ent_copy_src)).grid(row=0, column=2, pady=5)
+
+        tk.Label(frame_copy, text="Destination Folder:", font=("Arial", 9, "bold")).grid(row=1, column=0, sticky="w")
+        self.ent_copy_dst = tk.Entry(frame_copy, width=70)
+        self.ent_copy_dst.grid(row=1, column=1, padx=5, pady=5)
+        tk.Button(frame_copy, text="Browse...", command=lambda: self.browse(self.ent_copy_dst)).grid(row=1, column=2, pady=5)
+
+        self.copy_mode = tk.IntVar(value=0)
+        mode_frame = tk.Frame(frame_copy)
+        mode_frame.grid(row=2, column=0, columnspan=3, pady=5)
+        tk.Radiobutton(mode_frame, text="Copy (keep source)", variable=self.copy_mode, value=0).pack(side=tk.LEFT, padx=10)
+        tk.Radiobutton(mode_frame, text="Move (delete source after)", variable=self.copy_mode, value=1).pack(side=tk.LEFT, padx=10)
+
+        options_frame = tk.Frame(frame_copy)
+        options_frame.grid(row=3, column=0, columnspan=3, pady=5)
+
+        tk.Label(options_frame, text="Engine:", font=("Arial", 9, "bold")).pack(side=tk.LEFT, padx=(0, 5))
+        self.copy_engine = ttk.Combobox(options_frame, values=["Robocopy (fast, Windows)", "Python (cross-platform)"],
+                                        state="readonly", width=30)
+        self.copy_engine.current(0)
+        self.copy_engine.pack(side=tk.LEFT)
+
+        tk.Label(options_frame, text="   Threads:", font=("Arial", 9, "bold")).pack(side=tk.LEFT, padx=(10, 5))
+        self.hw_info = detect_optimal_threads()
+        thread_values = [self.hw_info["label"], "8", "16", "32", "64", "128"]
+        self.copy_threads = ttk.Combobox(options_frame, values=thread_values, state="readonly", width=35)
+        self.copy_threads.current(0)
+        self.copy_threads.pack(side=tk.LEFT)
+
+        btn_frame_copy = tk.Frame(frame_copy)
+        btn_frame_copy.grid(row=4, column=0, columnspan=3, pady=10)
+        self.btn_copy_start = tk.Button(btn_frame_copy, text="START", bg="#4caf50", fg="white",
+                                        font=("Arial", 10, "bold"), width=15, height=2, command=self.start_copy)
+        self.btn_copy_start.pack(side=tk.LEFT, padx=5)
+        self.btn_copy_cancel = tk.Button(btn_frame_copy, text="CANCEL", bg="#f44336", fg="white",
+                                          font=("Arial", 10, "bold"), width=15, height=2,
+                                          command=self.cancel_copy, state=tk.DISABLED)
+        self.btn_copy_cancel.pack(side=tk.LEFT, padx=5)
+
+        self.copy_stop_event = threading.Event()
+        self.copy_process = None
+
+        self.lbl_copy_stat = tk.Label(self.tab_copy, text="", fg="gray")
+        self.lbl_copy_stat.pack(pady=5)
+
+        self.txt_copy_log = tk.Text(self.tab_copy, height=15, state=tk.DISABLED, bg="#f5f5f5")
+        scroll_copy = ttk.Scrollbar(self.tab_copy, orient="vertical", command=self.txt_copy_log.yview)
+        self.txt_copy_log.configure(yscrollcommand=scroll_copy.set)
+        self.txt_copy_log.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(10, 0), pady=5)
+        scroll_copy.pack(side=tk.RIGHT, fill=tk.Y, padx=(0, 10), pady=5)
+
+        # Tab 4: Unzip
+        self.tab_unzip = tk.Frame(self.notebook)
+        self.notebook.add(self.tab_unzip, text="4. Unzip")
+
+        frame_unzip_top = tk.LabelFrame(self.tab_unzip, text="Select Zip Files", padx=10, pady=10)
+        frame_unzip_top.pack(fill=tk.X, padx=10, pady=10)
+
+        browse_frame = tk.Frame(frame_unzip_top)
+        browse_frame.pack(fill=tk.X)
+        tk.Button(browse_frame, text="Add Zip Files...", command=self.unzip_add_files).pack(side=tk.LEFT, padx=5)
+        tk.Button(browse_frame, text="Add Folder of Zips...", command=self.unzip_add_folder).pack(side=tk.LEFT, padx=5)
+        tk.Button(browse_frame, text="Remove Selected", command=self.unzip_remove_selected).pack(side=tk.LEFT, padx=5)
+        tk.Button(browse_frame, text="Clear All", command=self.unzip_clear).pack(side=tk.LEFT, padx=5)
+
+        self.lst_unzip = tk.Listbox(frame_unzip_top, height=8, selectmode=tk.EXTENDED, bg="#fff3e0")
+        scroll_unzip_list = ttk.Scrollbar(frame_unzip_top, orient="vertical", command=self.lst_unzip.yview)
+        self.lst_unzip.configure(yscrollcommand=scroll_unzip_list.set)
+        self.lst_unzip.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, pady=(5, 0))
+        scroll_unzip_list.pack(side=tk.RIGHT, fill=tk.Y, pady=(5, 0))
+
+        frame_unzip_opts = tk.Frame(self.tab_unzip)
+        frame_unzip_opts.pack(fill=tk.X, padx=10, pady=5)
+
+        tk.Label(frame_unzip_opts, text="Engine:", font=("Arial", 9, "bold")).pack(side=tk.LEFT, padx=(0, 5))
+        self.unzip_engine = ttk.Combobox(frame_unzip_opts,
+                                          values=["Windows tar (fast)", "Explorer (Shell.Application)"],
+                                          state="readonly", width=30)
+        self.unzip_engine.current(0)
+        self.unzip_engine.pack(side=tk.LEFT, padx=(0, 15))
+
+        self.unzip_overwrite = tk.BooleanVar(value=False)
+        tk.Checkbutton(frame_unzip_opts, text="Overwrite existing files", variable=self.unzip_overwrite).pack(side=tk.LEFT, padx=5)
+
+        self.unzip_subfolder = tk.BooleanVar(value=True)
+        tk.Checkbutton(frame_unzip_opts, text="Extract into subfolder (zip name)", variable=self.unzip_subfolder).pack(side=tk.LEFT, padx=5)
+
+        btn_unzip_frame = tk.Frame(self.tab_unzip)
+        btn_unzip_frame.pack(pady=5)
+        self.btn_unzip_start = tk.Button(btn_unzip_frame, text="UNZIP ALL", bg="#ff9800", fg="white",
+                                          font=("Arial", 10, "bold"), width=15, height=2, command=self.start_unzip)
+        self.btn_unzip_start.pack(side=tk.LEFT, padx=5)
+
+        self.lbl_unzip_stat = tk.Label(self.tab_unzip, text="", fg="gray")
+        self.lbl_unzip_stat.pack(pady=3)
+
+        self.txt_unzip_log = tk.Text(self.tab_unzip, height=10, state=tk.DISABLED, bg="#f5f5f5")
+        scroll_unzip_log = ttk.Scrollbar(self.tab_unzip, orient="vertical", command=self.txt_unzip_log.yview)
+        self.txt_unzip_log.configure(yscrollcommand=scroll_unzip_log.set)
+        self.txt_unzip_log.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(10, 0), pady=5)
+        scroll_unzip_log.pack(side=tk.RIGHT, fill=tk.Y, padx=(0, 10), pady=5)
+
+        # Tab 5: Empty Folder Remover
+        self.tab_empty = tk.Frame(self.notebook)
+        self.notebook.add(self.tab_empty, text="5. Empty Folders")
+
+        frame_empty_top = tk.LabelFrame(self.tab_empty, text="Scan for Empty Folders", padx=15, pady=10)
+        frame_empty_top.pack(fill=tk.X, padx=10, pady=10)
+
+        tk.Label(frame_empty_top, text="Folder to scan:", font=("Arial", 9, "bold")).grid(row=0, column=0, sticky="w")
+        self.ent_empty_path = tk.Entry(frame_empty_top, width=70)
+        self.ent_empty_path.grid(row=0, column=1, padx=5, pady=5)
+        tk.Button(frame_empty_top, text="Browse...", command=lambda: self.browse(self.ent_empty_path)).grid(row=0, column=2, pady=5)
+
+        btn_empty_frame = tk.Frame(frame_empty_top)
+        btn_empty_frame.grid(row=1, column=0, columnspan=3, pady=5)
+        self.btn_empty_scan = tk.Button(btn_empty_frame, text="SCAN", bg="#4caf50", fg="white",
+                                         font=("Arial", 10, "bold"), width=12, command=self.scan_empty_folders)
+        self.btn_empty_scan.pack(side=tk.LEFT, padx=5)
+        self.btn_empty_delete = tk.Button(btn_empty_frame, text="DELETE SELECTED", bg="#f44336", fg="white",
+                                           font=("Arial", 10, "bold"), width=15, command=self.delete_empty_folders,
+                                           state=tk.DISABLED)
+        self.btn_empty_delete.pack(side=tk.LEFT, padx=5)
+        self.btn_empty_select_all = tk.Button(btn_empty_frame, text="SELECT ALL", bg="#bbdefb",
+                                               font=("Arial", 10, "bold"), width=12, command=self.select_all_empty,
+                                               state=tk.DISABLED)
+        self.btn_empty_select_all.pack(side=tk.LEFT, padx=5)
+
+        self.lbl_empty_stat = tk.Label(self.tab_empty, text="", fg="gray")
+        self.lbl_empty_stat.pack(pady=3)
+
+        self.tree_empty = ttk.Treeview(self.tab_empty, columns=("path",), show="headings", selectmode="extended")
+        self.tree_empty.heading("path", text="Empty Folder Path")
+        self.tree_empty.column("path", width=800)
+        scroll_empty = ttk.Scrollbar(self.tab_empty, orient="vertical", command=self.tree_empty.yview)
+        self.tree_empty.configure(yscrollcommand=scroll_empty.set)
+        self.tree_empty.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(10, 0), pady=5)
+        scroll_empty.pack(side=tk.RIGHT, fill=tk.Y, padx=(0, 10), pady=5)
+
+        # Tab 6: Log
+        self.tab_log = tk.Frame(self.notebook)
+        self.notebook.add(self.tab_log, text="6. Log")
+
+        log_btn_frame = tk.Frame(self.tab_log)
+        log_btn_frame.pack(fill=tk.X, padx=10, pady=5)
+        tk.Button(log_btn_frame, text="Clear Log", command=self.clear_log).pack(side=tk.RIGHT, padx=5)
+
+        self.txt_log = tk.Text(self.tab_log, state=tk.DISABLED, bg="#fafafa", font=("Consolas", 9))
+        scroll_log = ttk.Scrollbar(self.tab_log, orient="vertical", command=self.txt_log.yview)
+        self.txt_log.configure(yscrollcommand=scroll_log.set)
+        self.txt_log.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(10, 0), pady=5)
+        scroll_log.pack(side=tk.RIGHT, fill=tk.Y, padx=(0, 10), pady=5)
+
+        handler = TextHandler(self.txt_log, root)
+        handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s: %(message)s', datefmt='%H:%M:%S'))
+        handler.setLevel(logging.INFO)
+        log.addHandler(handler)
+        log.setLevel(logging.INFO)
+
+        log.info("Application started.")
+
         self.toggle_mode()
 
     def toggle_mode(self):
@@ -474,6 +686,371 @@ class App:
             entry.delete(0, tk.END)
             entry.insert(0, prepare_path(d))
 
+    def _get_thread_count(self):
+        val = self.copy_threads.get()
+        if val.startswith("Auto"):
+            return self.hw_info["recommended"]
+        try:
+            return int(val)
+        except ValueError:
+            return 64
+
+    def start_copy(self):
+        src = self.ent_copy_src.get().strip()
+        dst = self.ent_copy_dst.get().strip()
+        if not src or not os.path.isdir(src):
+            return messagebox.showerror("Error", "Select a valid source folder.")
+        if not dst:
+            return messagebox.showerror("Error", "Select a destination folder.")
+
+        move = self.copy_mode.get() == 1
+        action = "Move" if move else "Copy"
+        engine = self.copy_engine.get()
+        threads = self._get_thread_count()
+
+        if not messagebox.askyesno("Confirm", f"{action} everything from:\n{src}\n\nTo:\n{dst}\n\nEngine: {engine}\nThreads: {threads}"):
+            return
+
+        self.copy_stop_event.clear()
+        self.btn_copy_start.config(state=tk.DISABLED)
+        self.btn_copy_cancel.config(state=tk.NORMAL)
+        self.lbl_copy_stat.config(text=f"{action} in progress...", fg="blue")
+        self.txt_copy_log.config(state=tk.NORMAL)
+        self.txt_copy_log.delete("1.0", tk.END)
+        self.txt_copy_log.config(state=tk.DISABLED)
+
+        if engine.startswith("Robocopy"):
+            threading.Thread(target=self._run_robocopy, args=(src, dst, move, action, threads), daemon=True).start()
+        else:
+            threading.Thread(target=self._run_python_copy, args=(src, dst, move, action, threads), daemon=True).start()
+
+    def cancel_copy(self):
+        self.copy_stop_event.set()
+        if self.copy_process:
+            try:
+                self.copy_process.terminate()
+            except Exception:
+                pass
+        self.lbl_copy_stat.config(text="Cancelled.", fg="red")
+        self.btn_copy_start.config(state=tk.NORMAL)
+        self.btn_copy_cancel.config(state=tk.DISABLED)
+
+    def _copy_finished(self, msg, color):
+        self.lbl_copy_stat.config(text=msg, fg=color)
+        self.btn_copy_start.config(state=tk.NORMAL)
+        self.btn_copy_cancel.config(state=tk.DISABLED)
+        self.copy_process = None
+
+    def _run_robocopy(self, src, dst, move, action, threads):
+        log.info(f"Robocopy {action}: {src} → {dst} ({threads} threads)")
+        cmd = ["robocopy", src, dst, "/E", f"/MT:{threads}", "/R:1", "/W:1", "/NP"]
+        if move:
+            cmd.append("/MOVE")
+        try:
+            self.copy_process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                                  text=True, encoding="utf-8", errors="replace")
+            for line in self.copy_process.stdout:
+                if self.copy_stop_event.is_set():
+                    self.copy_process.terminate()
+                    self.root.after(0, self._append_copy_log, "\n--- CANCELLED ---\n")
+                    return
+                self.root.after(0, self._append_copy_log, line)
+            self.copy_process.wait()
+            code = self.copy_process.returncode
+            if code <= 3:
+                msg = f"{action} completed successfully."
+                color = "green"
+            elif code <= 7:
+                msg = f"{action} completed with some mismatches or extra files (code {code})."
+                color = "orange"
+            else:
+                msg = f"{action} had errors (code {code})."
+                color = "red"
+        except Exception as e:
+            msg = f"Error: {e}"
+            color = "red"
+        self.root.after(0, self._copy_finished, msg, color)
+
+    def _copy_single_file(self, args):
+        src_file, dst_file, move = args
+        if self.copy_stop_event.is_set():
+            return (src_file, False, "cancelled")
+        try:
+            os.makedirs(os.path.dirname(dst_file), exist_ok=True)
+            if move:
+                shutil.move(src_file, dst_file)
+            else:
+                shutil.copy2(src_file, dst_file)
+            return (src_file, True, None)
+        except Exception as e:
+            return (src_file, False, str(e))
+
+    def _run_python_copy(self, src, dst, move, action, threads):
+        log.info(f"Python {action}: {src} → {dst} ({threads} threads)")
+        self.root.after(0, self._append_copy_log, "Listing files...\n")
+        file_pairs = []
+        for root, dirs, files in os.walk(src):
+            rel = os.path.relpath(root, src)
+            dest_dir = os.path.join(dst, rel)
+            for f in files:
+                file_pairs.append((os.path.join(root, f), os.path.join(dest_dir, f), move))
+
+        total = len(file_pairs)
+        copied = 0
+        failed = 0
+        workers = min(threads, total) if total > 0 else 1
+        self.root.after(0, self._append_copy_log, f"Found {total} files. {action} with {workers} threads...\n\n")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {executor.submit(self._copy_single_file, pair): pair for pair in file_pairs}
+            for future in concurrent.futures.as_completed(futures):
+                if self.copy_stop_event.is_set():
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    self.root.after(0, self._append_copy_log, f"\n--- CANCELLED after {copied} files ---\n")
+                    self.root.after(0, self._copy_finished, f"Cancelled. {copied} files copied before stop.", "red")
+                    return
+
+                path, success, err = future.result()
+                if success:
+                    copied += 1
+                else:
+                    failed += 1
+                    self.root.after(0, self._append_copy_log, f"FAILED: {path} — {err}\n")
+
+                if copied % 100 == 0 and copied > 0:
+                    self.root.after(0, self._append_copy_log, f"{action}: {copied}/{total} files...\n")
+
+        if move and not self.copy_stop_event.is_set():
+            for root, dirs, files in os.walk(src, topdown=False):
+                try:
+                    if not os.listdir(root):
+                        os.rmdir(root)
+                except Exception:
+                    pass
+
+        msg = f"{action} complete. {copied}/{total} files."
+        if failed:
+            msg += f" {failed} failed."
+        color = "green" if failed == 0 else "orange"
+        self.root.after(0, self._append_copy_log, f"\n{msg}\n")
+        self.root.after(0, self._copy_finished, msg, color)
+
+    def _append_copy_log(self, line):
+        self.txt_copy_log.config(state=tk.NORMAL)
+        self.txt_copy_log.insert(tk.END, line)
+        self.txt_copy_log.see(tk.END)
+        self.txt_copy_log.config(state=tk.DISABLED)
+
+    # --- UNZIP ---
+    def unzip_add_files(self):
+        files = filedialog.askopenfilenames(title="Select Zip Files",
+                                            filetypes=[("Zip files", "*.zip"), ("All files", "*.*")])
+        for f in files:
+            p = prepare_path(f)
+            current = list(self.lst_unzip.get(0, tk.END))
+            if p not in current:
+                self.lst_unzip.insert(tk.END, p)
+
+    def unzip_add_folder(self):
+        d = filedialog.askdirectory(title="Select folder containing zip files")
+        if d:
+            current = list(self.lst_unzip.get(0, tk.END))
+            for z in sorted(Path(d).glob("*.zip")):
+                p = prepare_path(str(z))
+                if p not in current:
+                    self.lst_unzip.insert(tk.END, p)
+
+    def unzip_remove_selected(self):
+        for i in reversed(self.lst_unzip.curselection()):
+            self.lst_unzip.delete(i)
+
+    def unzip_clear(self):
+        self.lst_unzip.delete(0, tk.END)
+
+    def clear_log(self):
+        self.txt_log.config(state=tk.NORMAL)
+        self.txt_log.delete("1.0", tk.END)
+        self.txt_log.config(state=tk.DISABLED)
+
+    # --- EMPTY FOLDER REMOVER ---
+    def scan_empty_folders(self):
+        folder = self.ent_empty_path.get().strip()
+        if not folder or not os.path.isdir(folder):
+            return messagebox.showerror("Error", "Select a valid folder to scan.")
+
+        for item in self.tree_empty.get_children():
+            self.tree_empty.delete(item)
+
+        self.btn_empty_scan.config(state=tk.DISABLED)
+        self.lbl_empty_stat.config(text="Scanning...", fg="blue")
+
+        def run():
+            empty_dirs = []
+            for dirpath, dirnames, filenames in os.walk(folder, topdown=False):
+                if dirpath == folder:
+                    continue
+                try:
+                    if not os.listdir(dirpath):
+                        empty_dirs.append(dirpath)
+                except Exception:
+                    pass
+
+            def populate():
+                for d in sorted(empty_dirs):
+                    self.tree_empty.insert("", "end", values=(d,))
+                count = len(empty_dirs)
+                self.lbl_empty_stat.config(text=f"Found {count} empty folder(s).", fg="green" if count == 0 else "#d32f2f")
+                self.btn_empty_scan.config(state=tk.NORMAL)
+                self.btn_empty_delete.config(state=tk.NORMAL if count > 0 else tk.DISABLED)
+                self.btn_empty_select_all.config(state=tk.NORMAL if count > 0 else tk.DISABLED)
+                log.info(f"Empty folder scan: {count} found in {folder}")
+
+            self.root.after(0, populate)
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def select_all_empty(self):
+        items = self.tree_empty.get_children()
+        if items:
+            self.tree_empty.selection_set(*items)
+
+    def delete_empty_folders(self):
+        sel = self.tree_empty.selection()
+        if not sel:
+            return messagebox.showinfo("Info", "Select folders to delete first.")
+
+        if not messagebox.askyesno("Confirm", f"Permanently delete {len(sel)} empty folder(s)?"):
+            return
+
+        removed = 0
+        failed = 0
+        for item_id in sel:
+            path = self.tree_empty.item(item_id, "values")[0]
+            try:
+                os.rmdir(path)
+                self.tree_empty.delete(item_id)
+                removed += 1
+            except Exception as e:
+                log.warning(f"Could not remove {path}: {e}")
+                failed += 1
+
+        msg = f"Removed {removed} folder(s)."
+        if failed:
+            msg += f" {failed} failed."
+        self.lbl_empty_stat.config(text=msg, fg="green" if failed == 0 else "orange")
+        log.info(f"Empty folder delete: {removed} removed, {failed} failed")
+
+        remaining = len(self.tree_empty.get_children())
+        self.btn_empty_delete.config(state=tk.NORMAL if remaining > 0 else tk.DISABLED)
+        self.btn_empty_select_all.config(state=tk.NORMAL if remaining > 0 else tk.DISABLED)
+
+    def _append_unzip_log(self, line):
+        self.txt_unzip_log.config(state=tk.NORMAL)
+        self.txt_unzip_log.insert(tk.END, line)
+        self.txt_unzip_log.see(tk.END)
+        self.txt_unzip_log.config(state=tk.DISABLED)
+
+    def start_unzip(self):
+        zips = list(self.lst_unzip.get(0, tk.END))
+        if not zips:
+            return messagebox.showerror("Error", "Add zip files first.")
+
+        engine = self.unzip_engine.get()
+        if not messagebox.askyesno("Confirm", f"Unzip {len(zips)} file(s) to their same folder?\n\nEngine: {engine}"):
+            return
+
+        self.btn_unzip_start.config(state=tk.DISABLED)
+        self.lbl_unzip_stat.config(text="Unzipping...", fg="blue")
+        self.txt_unzip_log.config(state=tk.NORMAL)
+        self.txt_unzip_log.delete("1.0", tk.END)
+        self.txt_unzip_log.config(state=tk.DISABLED)
+
+        overwrite = self.unzip_overwrite.get()
+        subfolder = self.unzip_subfolder.get()
+        threading.Thread(target=self._run_unzip, args=(zips, overwrite, subfolder, engine), daemon=True).start()
+
+    def _unzip_tar(self, zp, extract_to, overwrite):
+        tar_path = shutil.which("tar")
+        if not tar_path:
+            raise RuntimeError("Windows tar.exe not found on this computer.")
+        extract_to.mkdir(parents=True, exist_ok=True)
+        result = subprocess.run(
+            [tar_path, "-xf", str(zp), "-C", str(extract_to)],
+            capture_output=True, text=True, timeout=300
+        )
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr.strip() or result.stdout.strip())
+
+    def _unzip_explorer(self, zp, extract_to, overwrite):
+        extract_to.mkdir(parents=True, exist_ok=True)
+        vbs_code = f'''Set shell = CreateObject("Shell.Application")
+Set source = shell.NameSpace("{str(zp)}")
+Set destination = shell.NameSpace("{str(extract_to)}")
+If source Is Nothing Then
+    WScript.Echo "Could not open ZIP file."
+    WScript.Quit 1
+End If
+If destination Is Nothing Then
+    WScript.Echo "Could not open destination folder."
+    WScript.Quit 1
+End If
+destination.CopyHere source.Items, 16
+WScript.Sleep 2000
+'''
+        temp_vbs = None
+        try:
+            with tempfile.NamedTemporaryFile(mode="w", suffix=".vbs", delete=False, encoding="utf-8") as f:
+                temp_vbs = f.name
+                f.write(vbs_code)
+            result = subprocess.run(
+                ["cscript.exe", "//NoLogo", temp_vbs],
+                capture_output=True, text=True, timeout=300
+            )
+            if result.returncode != 0:
+                raise RuntimeError(result.stderr.strip() or result.stdout.strip())
+        finally:
+            if temp_vbs:
+                try:
+                    os.unlink(temp_vbs)
+                except Exception:
+                    pass
+
+    def _run_unzip(self, zips, overwrite, subfolder, engine):
+        log.info(f"Unzip started — {len(zips)} files, engine={engine}, overwrite={overwrite}, subfolder={subfolder}")
+
+        if engine.startswith("Windows tar"):
+            unzip_fn = self._unzip_tar
+        else:
+            unzip_fn = self._unzip_explorer
+
+        success = 0
+        failed = 0
+        for zip_path in zips:
+            zp = Path(zip_path)
+            if subfolder:
+                extract_to = zp.parent / zp.stem
+            else:
+                extract_to = zp.parent
+
+            self.root.after(0, self._append_unzip_log, f"Unzipping: {zp.name} → {extract_to}\n")
+
+            try:
+                unzip_fn(zp, extract_to, overwrite)
+                self.root.after(0, self._append_unzip_log, f"  OK\n")
+                success += 1
+            except Exception as e:
+                self.root.after(0, self._append_unzip_log, f"  FAILED: {e}\n")
+                log.warning(f"Unzip failed for {zp.name}: {e}")
+                failed += 1
+
+        msg = f"Done. {success} extracted."
+        if failed:
+            msg += f" {failed} failed."
+        color = "green" if failed == 0 else "orange"
+        log.info(f"Unzip complete — {success} OK, {failed} failed")
+        self.root.after(0, self._append_unzip_log, f"\n{msg}\n")
+        self.root.after(0, self.lbl_unzip_stat.config, {"text": msg, "fg": color})
+        self.root.after(0, self.btn_unzip_start.config, {"state": tk.NORMAL})
+
     def add_protected(self):
         d = filedialog.askdirectory(title="Select folder to protect")
         if d:
@@ -493,6 +1070,33 @@ class App:
                 return True
         return False
 
+    def cleanup_empty_folders(self):
+        """Walk scanned directories bottom-up and remove empty folders.
+        Skips protected folders and scan root folders themselves."""
+        roots = [self.target_path]
+        if self.master_path:
+            roots.append(self.master_path)
+
+        removed = 0
+        for scan_root in roots:
+            if not scan_root or not os.path.isdir(scan_root):
+                continue
+            for dirpath, dirnames, filenames in os.walk(scan_root, topdown=False):
+                if dirpath == scan_root:
+                    continue
+                if self.is_protected(dirpath):
+                    continue
+                try:
+                    if not os.listdir(dirpath):
+                        os.rmdir(dirpath)
+                        removed += 1
+                except Exception as e:
+                    log.warning(f"Could not remove empty folder {dirpath}: {e}")
+
+        if removed:
+            log.info(f"Cleaned up {removed} empty folder(s)")
+            self.lbl_stat.config(text=f"{self.lbl_stat.cget('text')} Removed {removed} empty folder(s).")
+
     def alert_user(self, title, msg):
         self.root.after(0, lambda: messagebox.showwarning(title, msg))
         self.root.after(0, lambda: self.btn_scan.config(state=tk.NORMAL))
@@ -509,6 +1113,8 @@ class App:
         self.btn_scan.config(state=tk.DISABLED)
         self.clear_results()
 
+        mode_name = "Smart" if self.scan_mode.get() == SCAN_SMART else "Full"
+        log.info(f"Scan started — mode: {mode_name}, target: {t}" + (f", master: {m}" if m else ""))
         Comparator(m, t, self.scan_mode.get(), self.update_ui, self.scan_finished, self.alert_user).start()
 
     def update_ui(self, msg, pct):
@@ -528,7 +1134,6 @@ class App:
         internal_dupes = []
 
         for ident, t_entries in self.last_target_idx.items():
-            t_paths = [e[0] for e in t_entries]
             if self.mode.get() == 1 and self.last_master_idx and ident in self.last_master_idx:
                 cross_dupes.append({
                     'master_file': self.last_master_idx[ident][0][0],
@@ -559,6 +1164,7 @@ class App:
 
         self.lbl_stat.config(text=f"Done. {len(internal_dupes)} internal groups, {len(cross_dupes)} cross-folder matches.")
         self.lbl_summary.config(text=f"Recoverable: {format_size(total_waste)} from {total_extra} duplicate files")
+        log.info(f"Scan complete — {len(internal_dupes)} internal groups, {len(cross_dupes)} cross matches, {format_size(total_waste)} recoverable")
 
     def populate_trees(self):
         self.clear_trees()
@@ -739,10 +1345,11 @@ class App:
             msg += f"\n{failed} files could not be trashed."
         messagebox.showinfo("Done", msg)
 
-        # Remove trashed items from UI without rescanning
+        log.info(f"Cross-folder trash: {trashed} trashed, {failed} failed")
         self.cross_dupes = []
         self.clear_trees()
         self.lbl_summary.config(text=f"Trashed {trashed} files.")
+        self.cleanup_empty_folders()
 
     def delete_selected_internal(self):
         """Trash all selected items (supports multi-select)."""
@@ -781,7 +1388,9 @@ class App:
                 log.warning(f"Could not trash {path}: {e}")
 
         if trashed:
+            log.info(f"Internal trash: {trashed} files deleted")
             self.lbl_stat.config(text=f"Trashed {trashed} files.")
+            self.cleanup_empty_folders()
 
     def select_all_except_best(self):
         """Select all non-KEEP items in every group for easy bulk delete.
@@ -832,10 +1441,11 @@ class App:
             msg += f"\n{failed} files could not be trashed."
         messagebox.showinfo("Done", msg)
 
-        # Refresh without full rescan - just clear and update
+        log.info(f"Auto-cull: {trashed} trashed, {failed} failed")
         self.internal_dupes = []
         self.clear_trees()
         self.lbl_summary.config(text=f"Trashed {trashed} files. Run a new scan to verify.")
+        self.cleanup_empty_folders()
 
 
 if __name__ == "__main__":
