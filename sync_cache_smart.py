@@ -38,20 +38,56 @@ class TextHandler(logging.Handler):
         self.text_widget.config(state=tk.DISABLED)
 
 # --- 1. SETUP & UTILS ---
-def install_and_import(package):
-    if importlib.util.find_spec(package) is None:
+def _version_tuple(v):
+    """Parse a version string like '2.1.0' into a comparable tuple of ints."""
+    parts = []
+    for chunk in str(v).split('.'):
+        num = ''.join(c for c in chunk if c.isdigit())
+        parts.append(int(num) if num else 0)
+    return tuple(parts)
+
+def install_and_import(package, pip_name=None, min_version=None):
+    """Ensure a package is installed (and optionally at min_version), then import it.
+
+    pip_name: name to pass to pip if it differs from the import name (e.g. 'Pillow' for 'PIL').
+    min_version: if set, upgrade the package when the installed version is older.
+    """
+    pip_name = pip_name or package
+    spec = importlib.util.find_spec(package)
+
+    needs_install = spec is None
+    needs_upgrade = False
+    if spec is not None and min_version:
         try:
-            subprocess.check_call([sys.executable, "-m", "pip", "install", package])
+            from importlib.metadata import version as _pkg_version
+            installed = _pkg_version(pip_name)
+            if _version_tuple(installed) < _version_tuple(min_version):
+                needs_upgrade = True
+                log.info(f"{pip_name} {installed} is older than {min_version}; upgrading.")
         except Exception as e:
-            log.warning(f"Could not install {package}: {e}")
+            log.warning(f"Could not determine {pip_name} version: {e}")
+
+    if needs_install or needs_upgrade:
+        cmd = [sys.executable, "-m", "pip", "install"]
+        if needs_upgrade:
+            cmd.append("--upgrade")
+        target = f"{pip_name}>={min_version}" if min_version else pip_name
+        cmd.append(target)
+        try:
+            subprocess.check_call(cmd)
+            importlib.invalidate_caches()
+        except Exception as e:
+            log.warning(f"Could not install/upgrade {pip_name}: {e}")
+
     try:
         return importlib.import_module(package)
     except ImportError as e:
         log.warning(f"Could not import {package}: {e}")
         return None
 
-send2trash = install_and_import('send2trash')
-PIL = install_and_import('PIL')
+# send2trash >= 1.5.0 is required for batched (list) deletion
+send2trash = install_and_import('send2trash', min_version='1.5.0')
+PIL = install_and_import('PIL', pip_name='Pillow')
 if PIL:
     from PIL import Image, ImageTk
 fitz = install_and_import('pymupdf')
@@ -1493,35 +1529,72 @@ WScript.Sleep 2000
         if vals:
             reveal_in_explorer(vals[-1])
 
+    def _trash_batch(self, paths, on_done):
+        """Trash a list of paths in a background thread using batched send2trash."""
+        def _worker():
+            trashed = 0
+            failed = 0
+            batch = []
+            for path in paths:
+                batch.append(path)
+                if len(batch) >= 50:
+                    try:
+                        send2trash.send2trash(batch)
+                        trashed += len(batch)
+                    except Exception:
+                        for p in batch:
+                            try:
+                                send2trash.send2trash(p)
+                                trashed += 1
+                            except Exception as e:
+                                log.warning(f"Could not trash {p}: {e}")
+                                failed += 1
+                    batch = []
+                    self.root.after(0, lambda t=trashed: self.lbl_stat.config(text=f"Trashing... {t}/{len(paths)}"))
+            if batch:
+                try:
+                    send2trash.send2trash(batch)
+                    trashed += len(batch)
+                except Exception:
+                    for p in batch:
+                        try:
+                            send2trash.send2trash(p)
+                            trashed += 1
+                        except Exception as e:
+                            log.warning(f"Could not trash {p}: {e}")
+                            failed += 1
+            self.root.after(0, on_done, trashed, failed)
+        threading.Thread(target=_worker, daemon=True).start()
+
     def trash_cross(self):
         if not self.cross_dupes:
             return
-        count = sum(len(d['target_files']) for d in self.cross_dupes)
-        if not messagebox.askyesno("Confirm", f"Trash {count} files from Tab 1?"):
-            return
-        trashed = 0
-        failed = 0
+        paths = []
         for d in self.cross_dupes:
             for path, size in d['target_files']:
                 if self.master_path and is_subpath(path, self.master_path):
                     continue
-                try:
-                    send2trash.send2trash(path)
-                    trashed += 1
-                except Exception as e:
-                    log.warning(f"Could not trash {path}: {e}")
-                    failed += 1
+                paths.append(path)
+        if not paths:
+            return
+        if not messagebox.askyesno("Confirm", f"Trash {len(paths)} files from Tab 1?"):
+            return
+        self.btn_scan.config(state=tk.DISABLED)
+        self.lbl_stat.config(text="Trashing...")
 
-        msg = f"Trashed {trashed} files."
-        if failed:
-            msg += f"\n{failed} files could not be trashed."
-        messagebox.showinfo("Done", msg)
+        def _done(trashed, failed):
+            msg = f"Trashed {trashed} files."
+            if failed:
+                msg += f"\n{failed} files could not be trashed."
+            messagebox.showinfo("Done", msg)
+            log.info(f"Cross-folder trash: {trashed} trashed, {failed} failed")
+            self.cross_dupes = []
+            self.clear_trees()
+            self.lbl_summary.config(text=f"Trashed {trashed} files.")
+            self.btn_scan.config(state=tk.NORMAL)
+            self.cleanup_empty_folders()
 
-        log.info(f"Cross-folder trash: {trashed} trashed, {failed} failed")
-        self.cross_dupes = []
-        self.clear_trees()
-        self.lbl_summary.config(text=f"Trashed {trashed} files.")
-        self.cleanup_empty_folders()
+        self._trash_batch(paths, _done)
 
     def delete_selected_internal(self):
         """Trash all selected items (supports multi-select)."""
@@ -1529,8 +1602,8 @@ WScript.Sleep 2000
         if not sel:
             return
 
-        # Collect paths from selection (skip group headers and protected files)
         paths_to_trash = []
+        item_ids = []
         skipped_protected = 0
         for item_id in sel:
             vals = self.tree_internal.item(item_id, "values")
@@ -1539,7 +1612,8 @@ WScript.Sleep 2000
                 if self.is_protected(path):
                     skipped_protected += 1
                     continue
-                paths_to_trash.append((item_id, path))
+                paths_to_trash.append(path)
+                item_ids.append(item_id)
 
         if skipped_protected:
             messagebox.showinfo("Protected", f"Skipped {skipped_protected} file(s) in protected folders.")
@@ -1550,19 +1624,22 @@ WScript.Sleep 2000
         if not messagebox.askyesno("Delete", f"Trash {len(paths_to_trash)} selected file(s)?"):
             return
 
-        trashed = 0
-        for item_id, path in paths_to_trash:
-            try:
-                send2trash.send2trash(path)
-                self.tree_internal.delete(item_id)
-                trashed += 1
-            except Exception as e:
-                log.warning(f"Could not trash {path}: {e}")
+        self.btn_scan.config(state=tk.DISABLED)
+        self.lbl_stat.config(text="Trashing...")
 
-        if trashed:
-            log.info(f"Internal trash: {trashed} files deleted")
-            self.lbl_stat.config(text=f"Trashed {trashed} files.")
-            self.cleanup_empty_folders()
+        def _done(trashed, failed):
+            for iid in item_ids:
+                try:
+                    self.tree_internal.delete(iid)
+                except Exception:
+                    pass
+            if trashed:
+                log.info(f"Internal trash: {trashed} files deleted")
+                self.lbl_stat.config(text=f"Trashed {trashed} files.")
+                self.cleanup_empty_folders()
+            self.btn_scan.config(state=tk.NORMAL)
+
+        self._trash_batch(paths_to_trash, _done)
 
     def select_all_except_best(self):
         """Select all non-KEEP items in every group for easy bulk delete.
@@ -1592,32 +1669,32 @@ WScript.Sleep 2000
                 f"Keep the best path in each group and trash {total_dupes} duplicates?"):
             return
 
-        trashed = 0
-        failed = 0
+        paths = []
         for group in self.internal_dupes:
-            # Sort by score, keep the best (lowest score)
             scored = sorted(group, key=lambda e: self._path_score(e[0]))
-            to_delete = scored[1:]  # everything except the best
-            for path, size in to_delete:
-                if self.is_protected(path):
-                    continue
-                try:
-                    send2trash.send2trash(path)
-                    trashed += 1
-                except Exception as e:
-                    log.warning(f"Could not trash {path}: {e}")
-                    failed += 1
+            for path, size in scored[1:]:
+                if not self.is_protected(path):
+                    paths.append(path)
 
-        msg = f"Trashed {trashed} duplicate files."
-        if failed:
-            msg += f"\n{failed} files could not be trashed."
-        messagebox.showinfo("Done", msg)
+        if not paths:
+            return
 
-        log.info(f"Auto-cull: {trashed} trashed, {failed} failed")
-        self.internal_dupes = []
-        self.clear_trees()
-        self.lbl_summary.config(text=f"Trashed {trashed} files. Run a new scan to verify.")
-        self.cleanup_empty_folders()
+        self.btn_scan.config(state=tk.DISABLED)
+        self.lbl_stat.config(text="Trashing...")
+
+        def _done(trashed, failed):
+            msg = f"Trashed {trashed} duplicate files."
+            if failed:
+                msg += f"\n{failed} files could not be trashed."
+            messagebox.showinfo("Done", msg)
+            log.info(f"Auto-cull: {trashed} trashed, {failed} failed")
+            self.internal_dupes = []
+            self.clear_trees()
+            self.lbl_summary.config(text=f"Trashed {trashed} files. Run a new scan to verify.")
+            self.btn_scan.config(state=tk.NORMAL)
+            self.cleanup_empty_folders()
+
+        self._trash_batch(paths, _done)
 
 
 if __name__ == "__main__":
