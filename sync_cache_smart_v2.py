@@ -101,6 +101,51 @@ def prepare_path(path):
         path = '\\\\?\\' + path
     return path
 
+
+def long_path(path):
+    r"""Force the Windows extended-length (\\?\) prefix regardless of current
+    length, so deep paths created *under* this one (e.g. Google Takeout photo
+    trees) don't hit the 260-char MAX_PATH limit during extraction."""
+    path = os.path.abspath(os.path.normpath(str(path)))
+    if platform.system() != 'Windows' or path.startswith('\\\\?\\'):
+        return path
+    if path.startswith('\\\\'):            # UNC share -> \\?\UNC\server\share
+        return '\\\\?\\UNC\\' + path[2:]
+    return '\\\\?\\' + path
+
+def force_rmdir(path):
+    r"""Remove an *empty* directory, working around the most common cause of
+    WinError 5 (Access is denied) on Windows: the folder carries a read-only,
+    hidden or system attribute (Google Drive folders and folders with a custom
+    icon/desktop.ini set these). We clear those attributes and retry through a
+    \\?\ long-path-prefixed handle.
+
+    Raises the underlying OSError if it still can't be removed (e.g. the folder
+    is locked open by Google Drive / antivirus / an Explorer window)."""
+    lp = long_path(path)
+    try:
+        os.rmdir(lp)
+        return
+    except PermissionError:
+        pass  # fall through to the attribute-clearing retry
+
+    # Clear FILE_ATTRIBUTE_READONLY/HIDDEN/SYSTEM, then try again.
+    if platform.system() == 'Windows':
+        try:
+            import ctypes
+            FILE_ATTRIBUTE_NORMAL = 0x80
+            ctypes.windll.kernel32.SetFileAttributesW(str(lp), FILE_ATTRIBUTE_NORMAL)
+        except Exception:
+            pass
+    else:
+        try:
+            os.chmod(lp, 0o777)
+        except Exception:
+            pass
+
+    os.rmdir(lp)  # let any remaining error propagate to the caller
+
+
 def _norm_for_compare(p):
     """Normalize a path for case/format-tolerant comparison."""
     p = str(p)
@@ -534,6 +579,12 @@ class App:
         tk.Radiobutton(scan_frame, text="Smart (recommended)", variable=self.scan_mode, value=SCAN_SMART).pack(side=tk.LEFT, padx=4)
         tk.Radiobutton(scan_frame, text="Full (hash everything)", variable=self.scan_mode, value=SCAN_FULL).pack(side=tk.LEFT, padx=4)
 
+        # When ticked, deletes bypass the Recycle Bin (os.remove) — much faster,
+        # but permanent: no undo.
+        self.permanent_delete = tk.BooleanVar(value=False)
+        tk.Checkbutton(frame_act, text="Permanently delete (skip Recycle Bin — no undo)",
+                       variable=self.permanent_delete, fg="#d32f2f").pack(side=tk.LEFT, padx=15)
+
         self.btn_scan = tk.Button(frame_act, text="START SCAN", bg="#4caf50", fg="white", font=("Arial", 10, "bold"), height=2, command=self.start_scan)
         self.btn_scan.pack(side=tk.RIGHT)
 
@@ -748,7 +799,7 @@ class App:
 
         tk.Label(frame_unzip_opts, text="Engine:", font=("Arial", 9, "bold")).pack(side=tk.LEFT, padx=(0, 5))
         self.unzip_engine = ttk.Combobox(frame_unzip_opts,
-                                          values=["Windows tar (fast)", "Explorer (Shell.Application)"],
+                                          values=["Windows tar (recommended)", "Explorer (small zips only)"],
                                           state="readonly", width=30)
         self.unzip_engine.current(0)
         self.unzip_engine.pack(side=tk.LEFT, padx=(0, 15))
@@ -757,7 +808,17 @@ class App:
         tk.Checkbutton(frame_unzip_opts, text="Overwrite existing files", variable=self.unzip_overwrite).pack(side=tk.LEFT, padx=5)
 
         self.unzip_subfolder = tk.BooleanVar(value=True)
-        tk.Checkbutton(frame_unzip_opts, text="Extract into subfolder (zip name)", variable=self.unzip_subfolder).pack(side=tk.LEFT, padx=5)
+        self.chk_subfolder = tk.Checkbutton(frame_unzip_opts, text="Extract into subfolder (zip name)",
+                                            variable=self.unzip_subfolder)
+        self.chk_subfolder.pack(side=tk.LEFT, padx=5)
+
+        # Google Takeout splits one folder tree across many zips; this merges
+        # every part into a single Takeout_Merged folder instead of one per zip.
+        self.unzip_merge = tk.BooleanVar(value=False)
+        self.chk_merge = tk.Checkbutton(frame_unzip_opts, text="Merge all into one folder (Takeout mode)",
+                                        variable=self.unzip_merge, fg="#1976d2",
+                                        command=self._toggle_merge_mode)
+        self.chk_merge.pack(side=tk.LEFT, padx=5)
 
         btn_unzip_frame = tk.Frame(self.tab_unzip)
         btn_unzip_frame.pack(pady=5)
@@ -1273,11 +1334,19 @@ class App:
 
         removed = 0
         failed = 0
+        locked = 0
         for item_id, path in entries:
             try:
-                os.rmdir(path)
+                force_rmdir(path)
                 self.tree_empty.delete(item_id)
                 removed += 1
+            except PermissionError as e:
+                # Attributes were already cleared; access-denied now almost always
+                # means the folder is held open by another process (Google Drive
+                # streaming, antivirus, an Explorer window sitting in it).
+                log.warning(f"Could not remove (locked / access denied) {path}: {e}")
+                failed += 1
+                locked += 1
             except Exception as e:
                 log.warning(f"Could not remove {path}: {e}")
                 failed += 1
@@ -1285,6 +1354,9 @@ class App:
         msg = f"Removed {removed} folder(s)."
         if failed:
             msg += f" {failed} failed."
+            if locked:
+                msg += (f" {locked} appear locked — close any Explorer window "
+                        f"in them and pause Google Drive sync, then re-scan.")
         self.lbl_empty_stat.config(text=msg, fg="green" if failed == 0 else "orange")
         log.info(f"Empty folder delete: {removed} removed, {failed} failed")
 
@@ -1298,13 +1370,27 @@ class App:
         self.txt_unzip_log.see(tk.END)
         self.txt_unzip_log.config(state=tk.DISABLED)
 
+    def _toggle_merge_mode(self):
+        # In Takeout merge mode the per-zip subfolder option is irrelevant.
+        if self.unzip_merge.get():
+            self.unzip_subfolder.set(False)
+            self.chk_subfolder.config(state=tk.DISABLED)
+        else:
+            self.chk_subfolder.config(state=tk.NORMAL)
+
     def start_unzip(self):
         zips = list(self.lst_unzip.get(0, tk.END))
         if not zips:
             return messagebox.showerror("Error", "Add zip files first.")
 
         engine = self.unzip_engine.get()
-        if not messagebox.askyesno("Confirm", f"Unzip {len(zips)} file(s) to their same folder?\n\nEngine: {engine}"):
+        merge = self.unzip_merge.get()
+        if merge:
+            dest_desc = f"merged into one folder under:\n{Path(zips[0]).parent / 'Takeout_Merged'}"
+        else:
+            dest_desc = "to their same folder"
+        if not messagebox.askyesno("Confirm",
+                f"Unzip {len(zips)} file(s) {dest_desc}\n\nEngine: {engine}"):
             return
 
         self.btn_unzip_start.config(state=tk.DISABLED)
@@ -1315,19 +1401,55 @@ class App:
 
         overwrite = self.unzip_overwrite.get()
         subfolder = self.unzip_subfolder.get()
-        threading.Thread(target=self._run_unzip, args=(zips, overwrite, subfolder, engine), daemon=True).start()
+        threading.Thread(target=self._run_unzip, args=(zips, overwrite, subfolder, engine, merge),
+                         daemon=True).start()
 
     def _unzip_tar(self, zp, extract_to, overwrite):
         tar_path = shutil.which("tar")
         if not tar_path:
             raise RuntimeError("Windows tar.exe not found on this computer.")
-        extract_to.mkdir(parents=True, exist_ok=True)
-        result = subprocess.run(
-            [tar_path, "-xf", str(zp), "-C", str(extract_to)],
-            capture_output=True, text=True, timeout=300
-        )
-        if result.returncode != 0:
-            raise RuntimeError(result.stderr.strip() or result.stdout.strip())
+        os.makedirs(long_path(extract_to), exist_ok=True)
+        # No timeout: Takeout zips can be tens of GB and take far longer than any
+        # fixed limit. -k (keep existing) makes the "overwrite" checkbox real.
+        cmd = [tar_path, "-xf", str(zp), "-C", str(extract_to)]
+        if not overwrite:
+            cmd.insert(1, "-k")
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=None)
+        # bsdtar: exit 1 = warnings (e.g. existing files skipped under -k),
+        # exit >=2 = fatal. Only treat fatal as a real failure.
+        if result.returncode >= 2:
+            err = result.stderr.strip() or result.stdout.strip()
+            # tar's most common fatal cause on Takeout is a path past the 260-char
+            # MAX_PATH limit. Retry with the long-path-safe Python extractor, which
+            # writes every file through a \\?\-prefixed path. It also picks up wherever
+            # tar left off (existing files are kept), so no work is repeated.
+            self.root.after(0, self._append_unzip_log,
+                            f"  tar failed ({err}); retrying long-path-safe...\n")
+            log.warning(f"tar failed for {Path(zp).name}: {err}; using long-path fallback")
+            self._extract_zip_longpath(zp, extract_to, overwrite)
+
+    def _extract_zip_longpath(self, zp, extract_to, overwrite):
+        r"""Long-path-safe extraction via Python's zipfile. Every member is written
+        through a \\?\-prefixed path, so deep Google Takeout trees beat the 260-char
+        MAX_PATH limit. Slower than tar but reliable; supports zip64 (>4 GB)."""
+        import zipfile
+        base = str(extract_to)
+        os.makedirs(long_path(base), exist_ok=True)
+        with zipfile.ZipFile(str(zp)) as zf:
+            for member in zf.infolist():
+                # Zip entries always use '/'; rebuild as OS path components.
+                parts = [p for p in member.filename.split('/') if p not in ('', '.', '..')]
+                if not parts:
+                    continue
+                target = long_path(os.path.join(base, *parts))
+                if member.is_dir() or member.filename.endswith('/'):
+                    os.makedirs(target, exist_ok=True)
+                    continue
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                if not overwrite and os.path.exists(target):
+                    continue
+                with zf.open(member) as src, open(target, 'wb') as dst:
+                    shutil.copyfileobj(src, dst, length=1024 * 1024)
 
     def _unzip_explorer(self, zp, extract_to, overwrite):
         extract_to.mkdir(parents=True, exist_ok=True)
@@ -1352,7 +1474,7 @@ WScript.Sleep 2000
                 f.write(vbs_code)
             result = subprocess.run(
                 ["cscript.exe", "//NoLogo", temp_vbs],
-                capture_output=True, text=True, timeout=300
+                capture_output=True, text=True, timeout=None
             )
             if result.returncode != 0:
                 raise RuntimeError(result.stderr.strip() or result.stdout.strip())
@@ -1363,12 +1485,16 @@ WScript.Sleep 2000
                 except Exception:
                     pass
 
-    def _run_unzip(self, zips, overwrite, subfolder, engine):
-        log.info(f"Unzip started — {len(zips)} files, engine={engine}, overwrite={overwrite}, subfolder={subfolder}")
+    def _run_unzip(self, zips, overwrite, subfolder, engine, merge=False):
+        log.info(f"Unzip started — {len(zips)} files, engine={engine}, overwrite={overwrite}, "
+                 f"subfolder={subfolder}, merge={merge}")
         success = 0
         failed = 0
         msg = "Done."
         color = "gray"
+        # Takeout merge: every part extracts into one shared folder so the split
+        # Takeout/ trees overlay into a single merged tree.
+        merge_dest = (Path(zips[0]).parent / "Takeout_Merged") if (merge and zips) else None
         try:
             if engine.startswith("Windows tar"):
                 unzip_fn = self._unzip_tar
@@ -1377,7 +1503,9 @@ WScript.Sleep 2000
 
             for zip_path in zips:
                 zp = Path(zip_path)
-                if subfolder:
+                if merge_dest is not None:
+                    extract_to = merge_dest
+                elif subfolder:
                     extract_to = zp.parent / zp.stem
                 else:
                     extract_to = zp.parent
@@ -1899,15 +2027,48 @@ WScript.Sleep 2000
             reveal_in_explorer(vals[-1])
 
     def _trash_batch(self, paths, on_done):
-        """Trash a list of paths in a background thread using batched send2trash."""
+        """Delete a list of paths in a background thread. Uses the Recycle Bin
+        (batched send2trash) by default, or permanent os.remove — much faster but
+        with no undo — when 'Permanently delete' is ticked."""
+        permanent = bool(self.permanent_delete.get())   # read Tk var on the main thread
+        total = len(paths)
+
         def _worker():
             trashed = 0
             failed = 0
             try:
-                batch = []
-                for path in paths:
-                    batch.append(path)
-                    if len(batch) >= 50:
+                if permanent:
+                    # Skip the Recycle Bin entirely. prepare_path adds the \\?\
+                    # prefix so very deep paths still delete.
+                    for i, path in enumerate(paths):
+                        try:
+                            os.remove(prepare_path(path))
+                            trashed += 1
+                        except Exception as e:
+                            log.warning(f"Could not delete {path}: {e}")
+                            failed += 1
+                        if (i + 1) % 50 == 0 or (i + 1) == total:
+                            self.root.after(0, lambda t=trashed: self.lbl_stat.config(
+                                text=f"Deleting... {t}/{total}"))
+                else:
+                    batch = []
+                    for path in paths:
+                        batch.append(path)
+                        if len(batch) >= 50:
+                            try:
+                                send2trash.send2trash(batch)
+                                trashed += len(batch)
+                            except Exception:
+                                for p in batch:
+                                    try:
+                                        send2trash.send2trash(p)
+                                        trashed += 1
+                                    except Exception as e:
+                                        log.warning(f"Could not trash {p}: {e}")
+                                        failed += 1
+                            batch = []
+                            self.root.after(0, lambda t=trashed: self.lbl_stat.config(text=f"Trashing... {t}/{total}"))
+                    if batch:
                         try:
                             send2trash.send2trash(batch)
                             trashed += len(batch)
@@ -1919,22 +2080,8 @@ WScript.Sleep 2000
                                 except Exception as e:
                                     log.warning(f"Could not trash {p}: {e}")
                                     failed += 1
-                        batch = []
-                        self.root.after(0, lambda t=trashed: self.lbl_stat.config(text=f"Trashing... {t}/{len(paths)}"))
-                if batch:
-                    try:
-                        send2trash.send2trash(batch)
-                        trashed += len(batch)
-                    except Exception:
-                        for p in batch:
-                            try:
-                                send2trash.send2trash(p)
-                                trashed += 1
-                            except Exception as e:
-                                log.warning(f"Could not trash {p}: {e}")
-                                failed += 1
             except Exception as e:
-                log.error(f"Trash worker crashed: {e}", exc_info=True)
+                log.error(f"Delete worker crashed: {e}", exc_info=True)
             finally:
                 # Always invoke on_done so the UI re-enables itself
                 self.root.after(0, on_done, trashed, failed)
