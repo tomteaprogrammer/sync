@@ -445,6 +445,10 @@ class App:
         self.folders = []
         self.protected = []
         self.clusters = []
+        self.trash_vars = {}
+        self.group_frames = []
+        self.card_frames = {}
+        self._thumb_refs = []
         self._photo = None
         self._preview_path = None
         self.scanner = None
@@ -502,37 +506,26 @@ class App:
 
         self.progress = ttk.Progressbar(root, mode="determinate")
         self.progress.pack(fill=tk.X, padx=10, pady=(4, 2))
-        self.lbl_stat = tk.Label(root, text="Add folders and Scan. Matches are review-only — nothing is auto-deleted.",
+        self.lbl_stat = tk.Label(root, text="Add folders and Scan. Compare each photo group, then select copies to trash.",
                                  fg="gray")
         self.lbl_stat.pack()
 
-        # --- Results: tree + preview ---
+        # --- Results: grouped photo gallery + preview ---
         paned = ttk.PanedWindow(root, orient=tk.HORIZONTAL)
         paned.pack(fill=tk.BOTH, expand=True, padx=10, pady=6)
 
         left = tk.Frame(paned)
-        self.tree = ttk.Treeview(left, columns=("name", "res", "size", "folder", "path"),
-                                 show="tree headings", selectmode="extended")
-        self.tree.heading("name", text="File")
-        self.tree.heading("res", text="Resolution")
-        self.tree.heading("size", text="Size")
-        self.tree.heading("folder", text="Folder")
-        self.tree.heading("path", text="Path")
-        self.tree.column("#0", width=28)
-        self.tree.column("name", width=240)
-        self.tree.column("res", width=90)
-        self.tree.column("size", width=80)
-        self.tree.column("folder", width=200)
-        self.tree.column("path", width=0, stretch=False)
-        sy = ttk.Scrollbar(left, orient="vertical", command=self.tree.yview)
-        self.tree.configure(yscrollcommand=sy.set)
-        self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.results_canvas = tk.Canvas(left, highlightthickness=0)
+        sy = ttk.Scrollbar(left, orient="vertical", command=self.results_canvas.yview)
+        self.results_canvas.configure(yscrollcommand=sy.set)
+        self.results_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         sy.pack(side=tk.RIGHT, fill=tk.Y)
-        self.tree.bind("<<TreeviewSelect>>", self._on_select)
-        self.tree.bind("<Double-1>", self._open_file)
-        self.tree.tag_configure("keep", foreground="#2e7d32")
-        self.tree.tag_configure("dupe", foreground="#666666")
-        self.tree.tag_configure("protected", foreground="#d32f2f", font=("Arial", 9, "bold"))
+        self.results_inner = tk.Frame(self.results_canvas)
+        self.results_window = self.results_canvas.create_window(
+            (0, 0), window=self.results_inner, anchor="nw")
+        self.results_inner.bind("<Configure>", self._on_gallery_configure)
+        self.results_canvas.bind("<Configure>", self._on_gallery_resize)
+        self.results_canvas.bind_all("<MouseWheel>", self._on_gallery_wheel)
         paned.add(left, weight=3)
 
         pv = tk.LabelFrame(paned, text="Preview", padx=5, pady=5)
@@ -549,7 +542,7 @@ class App:
         tk.Button(act, text="Trash Selected", bg="#ffcdd2", command=self.trash_selected).pack(side=tk.RIGHT, padx=4)
         tk.Button(act, text="Select All But Best", bg="#c8e6c9",
                   command=self.select_all_but_best).pack(side=tk.RIGHT, padx=4)
-        tk.Label(act, text="Live Photo .MOV partners are trashed together with their still.",
+        tk.Label(act, text="Click a thumbnail to preview. Live Photo .MOV partners go with their still.",
                  fg="#777").pack(side=tk.LEFT)
 
         self._sync_threshold()
@@ -617,7 +610,10 @@ class App:
             threshold = STRICTNESS["Strict"]
         self.protected = list(self.lst_prot.get(0, tk.END))
 
-        self._clear_tree()
+        self._clear_gallery()
+        self.trash_vars.clear()
+        self.card_frames.clear()
+        self.group_frames = []
         self.btn_scan.config(state=tk.DISABLED)
         self.scanner = Scanner(folders, threshold, self.cache,
                                self._progress, self._done, self._error)
@@ -638,28 +634,59 @@ class App:
 
     def _populate(self, clusters, stats):
         self.clusters = clusters
-        self._clear_tree()
-        for gi, group in enumerate(clusters):
-            best = group[0]
-            grp = self.tree.insert("", "end",
-                                   values=(f"[GROUP] {len(group)} similar", f"{best['w']}x{best['h']}",
-                                           "", "", ""), open=True)
+        self._clear_gallery()
+        self.trash_vars.clear()
+        self.card_frames.clear()
+        self.group_frames = []
+        self._thumb_refs = []
+        for group in clusters:
+            group_frame = tk.LabelFrame(
+                self.results_inner, text=f"{len(group)} similar photos", padx=6, pady=6)
+            group_frame.pack(fill=tk.X, padx=6, pady=5)
+            self.group_frames.append(group_frame)
             for i, rec in enumerate(group):
                 path = rec["path"]
                 protected = self.is_protected(path)
+                card = tk.Frame(group_frame, bd=1, relief=tk.GROOVE, padx=5, pady=5)
+                card.grid(row=i // 4, column=i % 4, sticky="nsew", padx=4, pady=4)
+                group_frame.grid_columnconfigure(i % 4, weight=1)
+
+                img = load_image(path)
+                if img is not None:
+                    try:
+                        img.thumbnail((140, 120), Image.LANCZOS)
+                        photo = ImageTk.PhotoImage(img)
+                        self._thumb_refs.append(photo)
+                        thumb = tk.Label(card, image=photo, cursor="hand2")
+                    except Exception:
+                        thumb = tk.Label(card, text="Preview unavailable", width=18, height=7)
+                else:
+                    thumb = tk.Label(card, text="Preview unavailable", width=18, height=7)
+                thumb.pack(pady=(0, 4))
+                thumb.bind("<Button-1>", lambda _e, p=path: self._show_preview(p))
+                thumb.bind("<Double-Button-1>", lambda _e, p=path: self._open_file(p))
+
+                if protected:
+                    label = "PROTECTED · KEEP" if i == 0 else "PROTECTED"
+                    tk.Label(card, text=label, fg="#d32f2f",
+                             font=("Arial", 9, "bold")).pack()
+                elif i == 0:
+                    tk.Label(card, text="KEEP · suggested best", fg="#2e7d32",
+                             font=("Arial", 9, "bold")).pack()
+                else:
+                    var = tk.BooleanVar(value=False)
+                    self.trash_vars[path] = var
+                    tk.Checkbutton(card, text="Select to trash", variable=var).pack()
+
                 name = os.path.basename(path)
                 if rec.get("partner"):
-                    name += "  +LivePhoto"
-                if protected:
-                    tag, prefix = "protected", "PROTECTED  "
-                elif i == 0:
-                    tag, prefix = "keep", "KEEP  "
-                else:
-                    tag, prefix = "dupe", ""
-                self.tree.insert(grp, "end", tags=(tag,),
-                                 values=(prefix + name, f"{rec['w']}x{rec['h']}",
-                                         _fmt_size(rec["size"]),
-                                         os.path.basename(os.path.dirname(path)), path))
+                    name += "  + Live Photo MOV"
+                tk.Label(card, text=name, wraplength=155, justify=tk.CENTER).pack()
+                tk.Label(card, text=f"{rec['w']}×{rec['h']} · {_fmt_size(rec['size'])}",
+                         fg="#666").pack()
+                tk.Label(card, text=os.path.dirname(path), wraplength=155,
+                         justify=tk.CENTER, fg="#777", font=("Arial", 7)).pack()
+                self.card_frames[path] = card
         self.progress.configure(value=100)
         self.btn_scan.config(state=tk.NORMAL)
         cached = stats.get("cached", 0)
@@ -674,17 +701,26 @@ class App:
                 text=f"No visual duplicates found among {stats['files']} files ({cached} from cache).",
                 fg="green")
 
-    def _clear_tree(self):
-        for x in self.tree.get_children():
-            self.tree.delete(x)
+    def _clear_gallery(self):
+        for child in self.results_inner.winfo_children():
+            child.destroy()
+
+    def _on_gallery_configure(self, event=None):
+        self.results_canvas.configure(scrollregion=self.results_canvas.bbox("all"))
+
+    def _on_gallery_resize(self, event):
+        self.results_canvas.itemconfigure(self.results_window, width=event.width)
+
+    def _on_gallery_wheel(self, event):
+        widget = self.root.winfo_containing(event.x_root, event.y_root)
+        while widget is not None:
+            if widget is self.results_canvas:
+                self.results_canvas.yview_scroll(int(-event.delta / 120), "units")
+                return
+            widget = getattr(widget, "master", None)
 
     # --- preview ---
-    def _on_select(self, event=None):
-        sel = self.tree.selection()
-        if not sel:
-            return
-        vals = self.tree.item(sel[0], "values")
-        path = vals[-1] if vals else ""
+    def _show_preview(self, path):
         if not path or not os.path.isfile(path):
             self.lbl_img.config(image="", text="Select a file", fg="gray")
             self.lbl_info.config(text="")
@@ -707,79 +743,138 @@ class App:
             size = "?"
         self.lbl_info.config(text=f"{os.path.basename(path)}\n{size}\n{path}")
 
-    def _open_file(self, event=None):
-        if self._preview_path and os.path.exists(self._preview_path):
+    def _open_file(self, path=None):
+        path = path or self._preview_path
+        if path and os.path.exists(path):
             try:
                 if platform.system() == "Windows":
-                    os.startfile(self._preview_path)
+                    os.startfile(path)
                 elif platform.system() == "Darwin":
-                    subprocess.call(["open", self._preview_path])
+                    subprocess.call(["open", path])
                 else:
-                    subprocess.call(["xdg-open", self._preview_path])
+                    subprocess.call(["xdg-open", path])
             except Exception:
                 pass
 
     # --- selection / deletion ---
     def select_all_but_best(self):
-        self.tree.selection_remove(*self.tree.selection())
-        pick = []
-        for grp in self.tree.get_children():
-            children = self.tree.get_children(grp)
-            for child in children[1:]:           # skip best/keeper
-                vals = self.tree.item(child, "values")
-                path = vals[-1] if vals else ""
-                if path and not self.is_protected(path):
-                    pick.append(child)
-        if pick:
-            self.tree.selection_set(*pick)
-            self.lbl_stat.config(text=f"Selected {len(pick)} non-best files (review before trashing).")
+        for var in self.trash_vars.values():
+            var.set(True)
+        self.lbl_stat.config(
+            text=f"Selected {len(self.trash_vars)} non-best files (review before trashing).")
 
     def trash_selected(self):
         if send2trash is None:
             return messagebox.showerror("Missing dep", "send2trash is required to delete.")
-        sel = self.tree.selection()
-        paths, partners, item_ids, skipped = [], [], [], 0
-        # Map a path back to its record so we can find Live Photo partners
         rec_by_path = {r["path"]: r for g in self.clusters for r in g}
-        for iid in sel:
-            vals = self.tree.item(iid, "values")
-            path = vals[-1] if vals else ""
-            if not path or not os.path.isfile(path):
+        paths = [path for path, var in self.trash_vars.items() if var.get()]
+        skipped = 0
+        existing_paths = []
+        for path in paths:
+            if not os.path.isfile(path):
                 continue
             if self.is_protected(path):
                 skipped += 1
                 continue
-            paths.append(path)
-            item_ids.append(iid)
-            rec = rec_by_path.get(path)
-            if rec and rec.get("partner") and os.path.isfile(rec["partner"]):
-                partners.append(rec["partner"])
+            existing_paths.append(path)
+        paths = existing_paths
 
         if skipped:
             messagebox.showinfo("Protected", f"Skipped {skipped} file(s) in protected folders.")
         if not paths:
-            return
-        extra = f"\n(+ {len(partners)} Live Photo .MOV partner(s))" if partners else ""
-        if not messagebox.askyesno("Trash", f"Send {len(paths)} file(s) to the Recycle Bin?{extra}"):
+            return messagebox.showinfo("Nothing selected", "Check the photos you want to send to the Recycle Bin.")
+
+        partners = []
+        for path in paths:
+            rec = rec_by_path.get(path)
+            partner = rec.get("partner") if rec else None
+            if (partner and os.path.isfile(partner) and not self.is_protected(partner)
+                    and partner not in paths and partner not in partners):
+                partners.append(partner)
+
+        # Show every selected file, including folder locations and Live Photo
+        # partners, so the user can review the exact operation before confirming.
+        confirm = tk.Toplevel(self.root)
+        confirm.title("Review files to send to the Recycle Bin")
+        confirm.geometry("760x500")
+        confirm.transient(self.root)
+        confirm.grab_set()
+        total = len(paths) + len(partners)
+        tk.Label(confirm, text=f"Review {total} file(s) before sending them to the Recycle Bin.",
+                 font=("Arial", 10, "bold")).pack(anchor="w", padx=12, pady=(12, 6))
+        list_frame = tk.Frame(confirm)
+        list_frame.pack(fill=tk.BOTH, expand=True, padx=12)
+        listing = ttk.Treeview(list_frame, columns=("kind", "name", "folder"), show="headings")
+        listing.heading("kind", text="Type")
+        listing.heading("name", text="File")
+        listing.heading("folder", text="Folder")
+        listing.column("kind", width=115, stretch=False)
+        listing.column("name", width=250)
+        listing.column("folder", width=360)
+        listing.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scroll = ttk.Scrollbar(list_frame, orient="vertical", command=listing.yview)
+        listing.configure(yscrollcommand=scroll.set)
+        scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        for path in paths:
+            listing.insert("", "end", values=("Selected photo", os.path.basename(path),
+                                                os.path.dirname(path)))
+        for path in partners:
+            listing.insert("", "end", values=("Live Photo MOV", os.path.basename(path),
+                                                os.path.dirname(path)))
+        confirmed = {"value": False}
+        buttons = tk.Frame(confirm)
+        buttons.pack(fill=tk.X, padx=12, pady=10)
+        tk.Button(buttons, text="Cancel", command=confirm.destroy).pack(side=tk.RIGHT, padx=(6, 0))
+        tk.Button(buttons, text="Send to Recycle Bin", bg="#ffcdd2",
+                  command=lambda: (confirmed.__setitem__("value", True), confirm.destroy())).pack(side=tk.RIGHT)
+        self.root.wait_window(confirm)
+        if not confirmed["value"]:
             return
 
-        trashed, failed = 0, 0
-        for p in paths + partners:
+        failures = []
+        trashed_paths = set()
+        for path in paths + partners:
             try:
-                send2trash.send2trash(p)
-                trashed += 1
+                # The Windows Recycle Bin API uses an extended-length path
+                # prefix (\\?\), which requires backslashes throughout.
+                # Folder paths entered as C:/... must be normalized first.
+                trash_path = os.path.normpath(os.path.abspath(path))
+                send2trash.send2trash(trash_path)
+                trashed_paths.add(path)
             except Exception as e:
-                print(f"Could not trash {p}: {e}")
-                failed += 1
-        for iid in item_ids:
-            try:
-                self.tree.delete(iid)
-            except Exception:
-                pass
-        msg = f"Trashed {trashed} file(s)."
-        if failed:
-            msg += f" {failed} failed."
-        self.lbl_stat.config(text=msg, fg="green" if not failed else "orange")
+                failures.append((path, str(e)))
+
+        # Remove only successfully trashed photo cards; failed cards remain
+        # checked so the user can inspect or retry them.
+        for path in paths:
+            if path in trashed_paths:
+                card = self.card_frames.pop(path, None)
+                if card is not None:
+                    card.destroy()
+                self.trash_vars.pop(path, None)
+        remaining_groups, remaining_frames = [], []
+        for group, frame in zip(self.clusters, self.group_frames):
+            remaining = [rec for rec in group if rec["path"] not in trashed_paths]
+            if remaining:
+                frame.config(text=f"{len(remaining)} similar photos")
+                for index, card in enumerate(frame.winfo_children()):
+                    card.grid_configure(row=index // 4, column=index % 4)
+                remaining_groups.append(remaining)
+                remaining_frames.append(frame)
+            else:
+                frame.destroy()
+        self.clusters = remaining_groups
+        self.group_frames = remaining_frames
+
+        msg = f"Sent {len(trashed_paths)} file(s) to the Recycle Bin."
+        if failures:
+            msg += f" {len(failures)} failed; see the error details."
+        self.lbl_stat.config(text=msg, fg="green" if not failures else "orange")
+        if failures:
+            details = "\n\n".join(f"{path}\n  {error}" for path, error in failures[:8])
+            if len(failures) > 8:
+                details += f"\n\n…and {len(failures) - 8} more failure(s)."
+            messagebox.showwarning("Could not send files to the Recycle Bin", details)
 
 
 def _fmt_size(n):
