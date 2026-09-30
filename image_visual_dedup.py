@@ -446,12 +446,32 @@ class App:
         self.protected = []
         self.clusters = []
         self.trash_vars = {}
-        self.group_frames = []
+        self.selected_paths = set()
+        self.group_views = []
+        self.group_page = 0
+        self.group_page_ranges = []
         self.card_frames = {}
-        self._thumb_refs = []
+        self.all_groups_expanded = False
+        self.gallery_page_size = 24
+        self.gallery_generation = 0
+        self._thumb_future = None
+        self._active_thumb_job = None
+        self._gallery_refresh_job = None
+        self.preview_visible = True
+        # One background page job at a time; that job uses a small bounded
+        # worker pool so decoding is parallel without multiplying memory use.
+        self.thumbnail_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         self._photo = None
         self._preview_path = None
         self.scanner = None
+        self.trash_worker = None
+        self._close_after_trash = False
+        self.trash_cancel = threading.Event()
+        self.trash_progress_win = None
+        self.trash_progress_bar = None
+        self.trash_progress_label = None
+        self.btn_trash = None
+        self.btn_select_all = None
         self.cache = load_cache()   # persistent hash cache — makes re-scans near-instant
 
         # --- Folders ---
@@ -511,12 +531,27 @@ class App:
         self.lbl_stat.pack()
 
         # --- Results: grouped photo gallery + preview ---
-        paned = ttk.PanedWindow(root, orient=tk.HORIZONTAL)
-        paned.pack(fill=tk.BOTH, expand=True, padx=10, pady=6)
+        self.paned = ttk.PanedWindow(root, orient=tk.HORIZONTAL)
+        self.paned.pack(fill=tk.BOTH, expand=True, padx=10, pady=6)
 
-        left = tk.Frame(paned)
+        left = tk.Frame(self.paned)
+        gallery_tools = tk.Frame(left)
+        gallery_tools.pack(fill=tk.X, padx=4, pady=(0, 4))
+        tk.Button(gallery_tools, text="Expand This Page", command=self.expand_all_groups).pack(side=tk.LEFT)
+        tk.Button(gallery_tools, text="Collapse This Page", command=self.collapse_all_groups).pack(
+            side=tk.LEFT, padx=4)
+        self.preview_button = tk.Button(gallery_tools, text="Hide Preview", command=self.toggle_preview)
+        self.preview_button.pack(side=tk.LEFT, padx=4)
+        group_nav = tk.Frame(gallery_tools)
+        group_nav.pack(side=tk.RIGHT)
+        self.prev_groups_button = tk.Button(group_nav, text="◀ Groups", command=self.previous_group_page)
+        self.prev_groups_button.pack(side=tk.LEFT)
+        self.group_page_label = tk.Label(group_nav, text="No groups")
+        self.group_page_label.pack(side=tk.LEFT, padx=6)
+        self.next_groups_button = tk.Button(group_nav, text="Groups ▶", command=self.next_group_page)
+        self.next_groups_button.pack(side=tk.LEFT)
         self.results_canvas = tk.Canvas(left, highlightthickness=0)
-        sy = ttk.Scrollbar(left, orient="vertical", command=self.results_canvas.yview)
+        sy = ttk.Scrollbar(left, orient="vertical", command=self._scroll_gallery)
         self.results_canvas.configure(yscrollcommand=sy.set)
         self.results_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         sy.pack(side=tk.RIGHT, fill=tk.Y)
@@ -526,23 +561,26 @@ class App:
         self.results_inner.bind("<Configure>", self._on_gallery_configure)
         self.results_canvas.bind("<Configure>", self._on_gallery_resize)
         self.results_canvas.bind_all("<MouseWheel>", self._on_gallery_wheel)
-        paned.add(left, weight=3)
+        self.paned.add(left, weight=3)
 
-        pv = tk.LabelFrame(paned, text="Preview", padx=5, pady=5)
-        self.lbl_img = tk.Label(pv, text="Select a file", fg="gray", bg="#f5f5f5")
-        self.lbl_img.pack(fill=tk.BOTH, expand=True)
-        self.lbl_info = tk.Label(pv, text="", font=("Arial", 8), fg="#555",
+        self.preview_panel = tk.Frame(self.paned)
+        tk.Label(self.preview_panel, text="Preview", font=("Arial", 10, "bold")).pack(anchor="w", padx=6, pady=4)
+        self.lbl_img = tk.Label(self.preview_panel, text="Select a file", fg="gray", bg="#f5f5f5")
+        self.lbl_img.pack(fill=tk.BOTH, expand=True, padx=5)
+        self.lbl_info = tk.Label(self.preview_panel, text="", font=("Arial", 8), fg="#555",
                                  wraplength=320, justify=tk.LEFT)
-        self.lbl_info.pack(fill=tk.X, pady=(5, 0))
-        paned.add(pv, weight=1)
+        self.lbl_info.pack(fill=tk.X, padx=5, pady=(5, 0))
+        self.paned.add(self.preview_panel, weight=1)
 
         # --- Actions ---
         act = tk.Frame(root, pady=6)
         act.pack(fill=tk.X, padx=10)
-        tk.Button(act, text="Trash Selected", bg="#ffcdd2", command=self.trash_selected).pack(side=tk.RIGHT, padx=4)
-        tk.Button(act, text="Select All But Best", bg="#c8e6c9",
-                  command=self.select_all_but_best).pack(side=tk.RIGHT, padx=4)
-        tk.Label(act, text="Click a thumbnail to preview. Live Photo .MOV partners go with their still.",
+        self.btn_trash = tk.Button(act, text="Trash Selected", bg="#ffcdd2", command=self.trash_selected)
+        self.btn_trash.pack(side=tk.RIGHT, padx=4)
+        self.btn_select_all = tk.Button(act, text="Select All But Best", bg="#c8e6c9",
+                                        command=self.select_all_but_best)
+        self.btn_select_all.pack(side=tk.RIGHT, padx=4)
+        tk.Label(act, text="Expand groups and scroll; thumbnails load as needed (24 per page).",
                  fg="#777").pack(side=tk.LEFT)
 
         self._sync_threshold()
@@ -610,10 +648,9 @@ class App:
             threshold = STRICTNESS["Strict"]
         self.protected = list(self.lst_prot.get(0, tk.END))
 
-        self._clear_gallery()
-        self.trash_vars.clear()
-        self.card_frames.clear()
-        self.group_frames = []
+        self.clusters = []
+        self.selected_paths.clear()
+        self._build_group_list(open_first=False)
         self.btn_scan.config(state=tk.DISABLED)
         self.scanner = Scanner(folders, threshold, self.cache,
                                self._progress, self._done, self._error)
@@ -633,60 +670,18 @@ class App:
         self.root.after(0, lambda: self._populate(clusters, stats))
 
     def _populate(self, clusters, stats):
-        self.clusters = clusters
-        self._clear_gallery()
-        self.trash_vars.clear()
-        self.card_frames.clear()
-        self.group_frames = []
-        self._thumb_refs = []
+        # A protected copy always wins keeper priority, even when another copy
+        # has a higher resolution or larger file size. Within the same
+        # protection status, prefer higher resolution and then larger size.
         for group in clusters:
-            group_frame = tk.LabelFrame(
-                self.results_inner, text=f"{len(group)} similar photos", padx=6, pady=6)
-            group_frame.pack(fill=tk.X, padx=6, pady=5)
-            self.group_frames.append(group_frame)
-            for i, rec in enumerate(group):
-                path = rec["path"]
-                protected = self.is_protected(path)
-                card = tk.Frame(group_frame, bd=1, relief=tk.GROOVE, padx=5, pady=5)
-                card.grid(row=i // 4, column=i % 4, sticky="nsew", padx=4, pady=4)
-                group_frame.grid_columnconfigure(i % 4, weight=1)
-
-                img = load_image(path)
-                if img is not None:
-                    try:
-                        img.thumbnail((140, 120), Image.LANCZOS)
-                        photo = ImageTk.PhotoImage(img)
-                        self._thumb_refs.append(photo)
-                        thumb = tk.Label(card, image=photo, cursor="hand2")
-                    except Exception:
-                        thumb = tk.Label(card, text="Preview unavailable", width=18, height=7)
-                else:
-                    thumb = tk.Label(card, text="Preview unavailable", width=18, height=7)
-                thumb.pack(pady=(0, 4))
-                thumb.bind("<Button-1>", lambda _e, p=path: self._show_preview(p))
-                thumb.bind("<Double-Button-1>", lambda _e, p=path: self._open_file(p))
-
-                if protected:
-                    label = "PROTECTED · KEEP" if i == 0 else "PROTECTED"
-                    tk.Label(card, text=label, fg="#d32f2f",
-                             font=("Arial", 9, "bold")).pack()
-                elif i == 0:
-                    tk.Label(card, text="KEEP · suggested best", fg="#2e7d32",
-                             font=("Arial", 9, "bold")).pack()
-                else:
-                    var = tk.BooleanVar(value=False)
-                    self.trash_vars[path] = var
-                    tk.Checkbutton(card, text="Select to trash", variable=var).pack()
-
-                name = os.path.basename(path)
-                if rec.get("partner"):
-                    name += "  + Live Photo MOV"
-                tk.Label(card, text=name, wraplength=155, justify=tk.CENTER).pack()
-                tk.Label(card, text=f"{rec['w']}×{rec['h']} · {_fmt_size(rec['size'])}",
-                         fg="#666").pack()
-                tk.Label(card, text=os.path.dirname(path), wraplength=155,
-                         justify=tk.CENTER, fg="#777", font=("Arial", 7)).pack()
-                self.card_frames[path] = card
+            group.sort(
+                key=lambda rec: (self.is_protected(rec["path"]),
+                                 rec["w"] * rec["h"], rec["size"]),
+                reverse=True,
+            )
+        self.clusters = clusters
+        self.selected_paths.clear()
+        self._build_group_list(open_first=True)
         self.progress.configure(value=100)
         self.btn_scan.config(state=tk.NORMAL)
         cached = stats.get("cached", 0)
@@ -701,21 +696,401 @@ class App:
                 text=f"No visual duplicates found among {stats['files']} files ({cached} from cache).",
                 fg="green")
 
+    def _compute_group_page_ranges(self):
+        # Keep each embedded Tk canvas segment comfortably below Tk's size limit.
+        # Estimate the worst expanded height for the first thumbnail page of each group.
+        ranges = []
+        start = 0
+        used_height = 0
+        height_limit = 20000
+        for index, group in enumerate(self.clusters):
+            rows = (min(len(group), self.gallery_page_size) + 3) // 4
+            estimated = 100 + rows * 300
+            if index > start and used_height + estimated > height_limit:
+                ranges.append((start, index))
+                start = index
+                used_height = 0
+            used_height += estimated
+        if start < len(self.clusters):
+            ranges.append((start, len(self.clusters)))
+        return ranges
+
+    def _build_group_list(self, open_first=False):
+        self.gallery_generation += 1
+        if self._thumb_future is not None:
+            self._thumb_future.cancel()
+            self._thumb_future = None
+        self._active_thumb_job = None
+        self.trash_vars.clear()
+        self.card_frames.clear()
+        self.group_views = []
+        self.all_groups_expanded = False
+        self._clear_gallery()
+        self.group_page_ranges = self._compute_group_page_ranges()
+        page_count = max(1, len(self.group_page_ranges))
+        self.group_page = min(self.group_page, page_count - 1)
+        if self.group_page_ranges:
+            start, end = self.group_page_ranges[self.group_page]
+            for cluster_index in range(start, end):
+                group = self.clusters[cluster_index]
+                group_frame = tk.Frame(self.results_inner, bd=1, relief=tk.GROOVE, padx=5, pady=4)
+                group_frame.pack(fill=tk.X, padx=6, pady=4)
+                header = tk.Button(
+                    group_frame,
+                    text=f"▶ Group {cluster_index + 1} · {len(group)} similar photos",
+                    anchor="w",
+                    command=lambda i=len(self.group_views): self._toggle_gallery_group(i),
+                )
+                header.pack(fill=tk.X)
+                content = tk.Frame(group_frame)
+                view = {"frame": group_frame, "header": header, "content": content,
+                        "records": group, "cluster_index": cluster_index,
+                        "expanded": False, "page": 0, "loading": False, "loaded": False,
+                        "token": 0, "body": None, "photo_refs": [], "page_paths": [],
+                        "reserved_height": 0}
+                self.group_views.append(view)
+        if self.clusters:
+            start, end = self.group_page_ranges[self.group_page]
+            self.group_page_label.config(
+                text=f"Groups {start + 1}–{end} of {len(self.clusters)} · page {self.group_page + 1}/{page_count}")
+        else:
+            self.group_page_label.config(text="No groups")
+        self.prev_groups_button.config(state=tk.NORMAL if self.group_page > 0 else tk.DISABLED)
+        self.next_groups_button.config(state=tk.NORMAL if self.group_page + 1 < page_count else tk.DISABLED)
+        if open_first and self.group_views:
+            self._set_group_expanded(0, True)
+
+    def previous_group_page(self):
+        if self.group_page > 0:
+            self.group_page -= 1
+            self.results_canvas.yview_moveto(0)
+            self._build_group_list(open_first=False)
+
+    def next_group_page(self):
+        if self.group_page + 1 < len(self.group_page_ranges):
+            self.group_page += 1
+            self.results_canvas.yview_moveto(0)
+            self._build_group_list(open_first=False)
+
     def _clear_gallery(self):
         for child in self.results_inner.winfo_children():
             child.destroy()
 
+    def _toggle_gallery_group(self, index):
+        self._set_group_expanded(index, not self.group_views[index]["expanded"])
+        self.all_groups_expanded = bool(self.group_views) and all(
+            view["expanded"] for view in self.group_views)
+
+    def _set_group_expanded(self, index, expanded):
+        view = self.group_views[index]
+        view["expanded"] = expanded
+        if expanded:
+            view["header"].config(text=f"▼ Group {view['cluster_index'] + 1} · {len(view['records'])} similar photos")
+            view["content"].pack(fill=tk.X, padx=4, pady=(4, 0))
+            if view["body"] is None:
+                self._show_group_placeholder(view, "Scroll into view to load thumbnails")
+            self._schedule_gallery_refresh()
+        else:
+            view["header"].config(text=f"▶ Group {view['cluster_index'] + 1} · {len(view['records'])} similar photos")
+            view["content"].pack_forget()
+            view["token"] += 1
+            if self._active_thumb_job and self._active_thumb_job[0] == index and self._thumb_future:
+                self._thumb_future.cancel()
+            self._discard_group_images(view, keep_space=False)
+            for child in view["content"].winfo_children():
+                child.destroy()
+            view["body"] = None
+            view["loaded"] = False
+            view["loading"] = False
+
+    def expand_all_groups(self):
+        self.all_groups_expanded = True
+        for index in range(len(self.group_views)):
+            self._set_group_expanded(index, True)
+        self._schedule_gallery_refresh()
+
+    def collapse_all_groups(self):
+        self.all_groups_expanded = False
+        for index in range(len(self.group_views)):
+            self._set_group_expanded(index, False)
+
+    def toggle_preview(self):
+        if self.preview_visible:
+            self.paned.forget(self.preview_panel)
+            self.preview_button.config(text="Show Preview")
+            self.preview_visible = False
+        else:
+            self.paned.add(self.preview_panel, weight=1)
+            self.preview_button.config(text="Hide Preview")
+            self.preview_visible = True
+        self._schedule_gallery_refresh()
+
+    def _show_group_placeholder(self, view, text):
+        content = view["content"]
+        for child in content.winfo_children():
+            child.destroy()
+        tk.Label(content, text=text, fg="#666", anchor="w").pack(fill=tk.X, padx=6, pady=4)
+        view["body"] = None
+        view["loaded"] = False
+
+    def _discard_group_images(self, view, keep_space=True):
+        body = view.get("body")
+        if body is None:
+            return
+        if keep_space:
+            try:
+                view["reserved_height"] = max(view["reserved_height"], body.winfo_height())
+            except Exception:
+                pass
+        for path in view.get("page_paths", []):
+            self.trash_vars.pop(path, None)
+            self.card_frames.pop(path, None)
+        view["page_paths"] = []
+        view["photo_refs"] = []
+        for child in body.winfo_children():
+            child.destroy()
+        if keep_space and view["reserved_height"] > 0:
+            body.configure(height=view["reserved_height"])
+            body.pack_propagate(False)
+            tk.Label(body, text="Thumbnails unloaded to save memory · scroll back to reload",
+                     fg="#777").place(relx=0.5, rely=0.5, anchor="center")
+        else:
+            body.destroy()
+            view["body"] = None
+        view["loaded"] = False
+        view["loading"] = False
+
+    def _group_is_visible(self, view):
+        if not view["expanded"] or not view["frame"].winfo_ismapped():
+            return False
+        canvas_top = self.results_canvas.winfo_rooty()
+        canvas_bottom = canvas_top + self.results_canvas.winfo_height()
+        group_top = view["frame"].winfo_rooty()
+        group_bottom = group_top + view["frame"].winfo_height()
+        return group_bottom > canvas_top and group_top < canvas_bottom
+
+    def _schedule_gallery_refresh(self):
+        if self._gallery_refresh_job is None:
+            self._gallery_refresh_job = self.root.after_idle(self._refresh_visible_groups)
+
+    def _refresh_visible_groups(self):
+        self._gallery_refresh_job = None
+        if not self.group_views:
+            return
+        for view in self.group_views:
+            visible = self._group_is_visible(view)
+            if not visible and view["loaded"]:
+                self._discard_group_images(view, keep_space=True)
+            elif not visible and view["loading"]:
+                view["token"] += 1
+                view["loading"] = False
+        if self._thumb_future is not None:
+            return
+        for index, view in enumerate(self.group_views):
+            if view["expanded"] and self._group_is_visible(view) and not view["loaded"] and not view["loading"]:
+                self._load_visible_group(index)
+                return
+
+    @staticmethod
+    def _load_thumbnail_batch(records):
+        def load_one(rec):
+            source = None
+            thumb = None
+            try:
+                path = rec["path"]
+                if os.path.splitext(path)[1].lower() in VIDEO_EXTS:
+                    source = _load_video_frame(path)
+                else:
+                    source = Image.open(path)
+                if source is not None:
+                    source.thumbnail((140, 120), Image.LANCZOS)
+                    thumb = source.convert("RGB")
+            except Exception:
+                thumb = None
+            finally:
+                if source is not None:
+                    try:
+                        source.close()
+                    except Exception:
+                        pass
+            return rec, thumb
+
+        with concurrent.futures.ThreadPoolExecutor(
+                max_workers=min(4, len(records) or 1)) as workers:
+            return list(workers.map(load_one, records))
+
+    def _render_gallery_page(self, group_index, page):
+        view = self.group_views[group_index]
+        view["token"] += 1
+        self._discard_group_images(view, keep_space=False)
+        view["page"] = page
+        view["loading"] = False
+        self._show_group_placeholder(view, "Scroll into view to load thumbnails")
+        view["expanded"] = True
+        view["header"].config(text=f"▼ Group {view['cluster_index'] + 1} · {len(view['records'])} similar photos")
+        view["content"].pack(fill=tk.X, padx=4, pady=(4, 0))
+        self._schedule_gallery_refresh()
+
+    def _load_visible_group(self, group_index):
+        view = self.group_views[group_index]
+        group = view["records"]
+        page = view["page"]
+        start = page * self.gallery_page_size
+        stop = min(start + self.gallery_page_size, len(group))
+        records = group[start:stop]
+        content = view["content"]
+        for child in content.winfo_children():
+            child.destroy()
+        page_count = max(1, (len(group) + self.gallery_page_size - 1) // self.gallery_page_size)
+        controls = tk.Frame(content)
+        controls.pack(fill=tk.X, pady=(0, 5))
+        tk.Button(controls, text="Previous", state=tk.NORMAL if page else tk.DISABLED,
+                  command=lambda: self._render_gallery_page(group_index, page - 1)).pack(side=tk.LEFT)
+        tk.Label(controls, text=f"Photos {start + 1}–{stop} of {len(group)} · page {page + 1}/{page_count}").pack(
+            side=tk.LEFT, padx=8)
+        tk.Button(controls, text="Next", state=tk.NORMAL if page + 1 < page_count else tk.DISABLED,
+                  command=lambda: self._render_gallery_page(group_index, page + 1)).pack(side=tk.LEFT)
+        body = tk.Frame(content)
+        body.pack(fill=tk.X)
+        view["body"] = body
+        view["loading"] = True
+        view["loaded"] = False
+        view["token"] += 1
+        token = view["token"]
+        tk.Label(body, text="Loading thumbnails…", fg="#666").pack(pady=12)
+        generation = self.gallery_generation
+        future = self.thumbnail_pool.submit(self._load_thumbnail_batch, records)
+        self._thumb_future = future
+        self._active_thumb_job = (group_index, token)
+        future.add_done_callback(
+            lambda done, gi=group_index, pg=page, gen=generation, tok=token, frame=body:
+                self._schedule_thumbnail_finish(gi, pg, gen, tok, frame, done))
+
+    def _schedule_thumbnail_finish(self, group_index, page, generation, token, body, future):
+        try:
+            self.root.after(0, lambda: self._finish_thumbnail_batch(
+                group_index, page, generation, token, body, future))
+        except Exception:
+            pass
+
+    def _finish_thumbnail_batch(self, group_index, page, generation, token, body, future):
+        try:
+            batch = future.result()
+        except Exception as e:
+            batch = None
+            error = e
+        else:
+            error = None
+        if self._thumb_future is future:
+            self._thumb_future = None
+            self._active_thumb_job = None
+        if (generation != self.gallery_generation or group_index >= len(self.group_views)):
+            self._close_thumbnail_batch(batch)
+            return
+        view = self.group_views[group_index]
+        if (view["token"] != token or not view["expanded"] or not self._group_is_visible(view)
+                or not body.winfo_exists()):
+            self._close_thumbnail_batch(batch)
+            if view["token"] == token:
+                view["loading"] = False
+            self._schedule_gallery_refresh()
+            return
+        if error is not None:
+            for child in body.winfo_children():
+                child.destroy()
+            tk.Label(body, text=f"Could not load thumbnails: {error}", fg="red").pack(pady=10)
+            view["loading"] = False
+            return
+        for child in body.winfo_children():
+            child.destroy()
+        base_index = page * self.gallery_page_size
+        view["photo_refs"] = []
+        view["page_paths"] = []
+        for offset, (rec, img) in enumerate(batch):
+            path = rec["path"]
+            absolute_index = base_index + offset
+            protected = self.is_protected(path)
+            card = tk.Frame(body, bd=1, relief=tk.GROOVE, padx=5, pady=5)
+            card.grid(row=offset // 4, column=offset % 4, sticky="nsew", padx=4, pady=4)
+            body.grid_columnconfigure(offset % 4, weight=1)
+            if img is not None:
+                try:
+                    photo = ImageTk.PhotoImage(img)
+                    view["photo_refs"].append(photo)
+                    thumb = tk.Label(card, image=photo, cursor="hand2")
+                except Exception:
+                    thumb = tk.Label(card, text="Preview unavailable", width=18, height=7)
+                finally:
+                    try:
+                        img.close()
+                    except Exception:
+                        pass
+            else:
+                thumb = tk.Label(card, text="Preview unavailable", width=18, height=7)
+            thumb.pack(pady=(0, 4))
+            thumb.bind("<Button-1>", lambda _e, p=path: self._show_preview(p))
+            thumb.bind("<Double-Button-1>", lambda _e, p=path: self._open_file(p))
+
+            if protected:
+                label = "PROTECTED · KEEP" if absolute_index == 0 else "PROTECTED"
+                tk.Label(card, text=label, fg="#d32f2f", font=("Arial", 9, "bold")).pack()
+            elif absolute_index == 0:
+                tk.Label(card, text="KEEP · suggested best", fg="#2e7d32",
+                         font=("Arial", 9, "bold")).pack()
+            else:
+                var = tk.BooleanVar(value=path in self.selected_paths)
+                self.trash_vars[path] = var
+                tk.Checkbutton(card, text="Select to trash", variable=var,
+                               command=lambda p=path, v=var: self._set_trash_selection(p, v)).pack()
+
+            name = os.path.basename(path)
+            if rec.get("partner"):
+                name += "  + Live Photo MOV"
+            tk.Label(card, text=name, wraplength=155, justify=tk.CENTER).pack()
+            tk.Label(card, text=f"{rec['w']}×{rec['h']} · {_fmt_size(rec['size'])}",
+                     fg="#666").pack()
+            tk.Label(card, text=os.path.dirname(path), wraplength=155,
+                     justify=tk.CENTER, fg="#777", font=("Arial", 7)).pack()
+            self.card_frames[path] = card
+            view["page_paths"].append(path)
+        view["loading"] = False
+        view["loaded"] = True
+        view["reserved_height"] = max(view["reserved_height"], body.winfo_reqheight())
+        self._schedule_gallery_refresh()
+
+    @staticmethod
+    def _close_thumbnail_batch(batch):
+        for _, image in batch or []:
+            if image is not None:
+                try:
+                    image.close()
+                except Exception:
+                    pass
+
+    def _set_trash_selection(self, path, var):
+        if var.get():
+            self.selected_paths.add(path)
+        else:
+            self.selected_paths.discard(path)
+
     def _on_gallery_configure(self, event=None):
         self.results_canvas.configure(scrollregion=self.results_canvas.bbox("all"))
+        self._schedule_gallery_refresh()
 
     def _on_gallery_resize(self, event):
         self.results_canvas.itemconfigure(self.results_window, width=event.width)
+        self._schedule_gallery_refresh()
+
+    def _scroll_gallery(self, *args):
+        self.results_canvas.yview(*args)
+        self._schedule_gallery_refresh()
 
     def _on_gallery_wheel(self, event):
         widget = self.root.winfo_containing(event.x_root, event.y_root)
         while widget is not None:
             if widget is self.results_canvas:
                 self.results_canvas.yview_scroll(int(-event.delta / 120), "units")
+                self._schedule_gallery_refresh()
                 return
             widget = getattr(widget, "master", None)
 
@@ -758,16 +1133,23 @@ class App:
 
     # --- selection / deletion ---
     def select_all_but_best(self):
-        for var in self.trash_vars.values():
-            var.set(True)
+        self.selected_paths = {
+            rec["path"]
+            for group in self.clusters
+            for rec in group[1:]
+            if not self.is_protected(rec["path"])
+        }
+        for path, var in self.trash_vars.items():
+            var.set(path in self.selected_paths)
         self.lbl_stat.config(
-            text=f"Selected {len(self.trash_vars)} non-best files (review before trashing).")
+            text=f"Selected {len(self.selected_paths)} non-best files (review before trashing).")
 
     def trash_selected(self):
         if send2trash is None:
             return messagebox.showerror("Missing dep", "send2trash is required to delete.")
         rec_by_path = {r["path"]: r for g in self.clusters for r in g}
-        paths = [path for path, var in self.trash_vars.items() if var.get()]
+        paths = [rec["path"] for group in self.clusters for rec in group
+                 if rec["path"] in self.selected_paths]
         skipped = 0
         existing_paths = []
         for path in paths:
@@ -831,50 +1213,122 @@ class App:
         if not confirmed["value"]:
             return
 
+        self._start_trash_batch(paths + partners)
+
+    def _start_trash_batch(self, paths):
+        self.trash_cancel.clear()
+        total = len(paths)
+        self.trash_progress_win = tk.Toplevel(self.root)
+        self.trash_progress_win.title("Sending files to the Recycle Bin")
+        self.trash_progress_win.geometry("480x150")
+        self.trash_progress_win.transient(self.root)
+        self.trash_progress_win.protocol("WM_DELETE_WINDOW", self._request_trash_cancel)
+        self.trash_progress_label = tk.Label(
+            self.trash_progress_win, text=f"Processed 0 of {total} files…")
+        self.trash_progress_label.pack(anchor="w", padx=14, pady=(14, 6))
+        self.trash_progress_bar = ttk.Progressbar(
+            self.trash_progress_win, mode="determinate", maximum=total)
+        self.trash_progress_bar.pack(fill=tk.X, padx=14, pady=6)
+        self.trash_cancel_button = tk.Button(
+            self.trash_progress_win, text="Cancel after current file", command=self._request_trash_cancel)
+        self.trash_cancel_button.pack(anchor="e", padx=14, pady=8)
+        self.btn_trash.config(state=tk.DISABLED)
+        self.btn_select_all.config(state=tk.DISABLED)
+        self.btn_scan.config(state=tk.DISABLED)
+        self.trash_worker = threading.Thread(
+            target=self._run_trash_batch, args=(list(paths),), daemon=True)
+        self.trash_worker.start()
+
+    def _request_trash_cancel(self):
+        self.trash_cancel.set()
+        if self.trash_progress_label is not None:
+            self.trash_progress_label.config(text="Stopping after the current file…")
+        if hasattr(self, "trash_cancel_button"):
+            self.trash_cancel_button.config(state=tk.DISABLED)
+
+    def _run_trash_batch(self, paths):
         failures = []
         trashed_paths = set()
-        for path in paths + partners:
+        processed = 0
+        for path in paths:
+            if self.trash_cancel.is_set():
+                break
             try:
-                # The Windows Recycle Bin API uses an extended-length path
-                # prefix (\\?\), which requires backslashes throughout.
-                # Folder paths entered as C:/... must be normalized first.
+                # Normalize Windows paths before the Recycle Bin API adds \\?\.
                 trash_path = os.path.normpath(os.path.abspath(path))
                 send2trash.send2trash(trash_path)
                 trashed_paths.add(path)
             except Exception as e:
                 failures.append((path, str(e)))
+            processed += 1
+            if processed == 1 or processed % 10 == 0 or processed == len(paths):
+                try:
+                    self.root.after(0, lambda n=processed, sent=len(trashed_paths), total=len(paths):
+                                    self._update_trash_progress(n, sent, total))
+                except Exception:
+                    pass
+        cancelled = self.trash_cancel.is_set() and processed < len(paths)
+        try:
+            self.root.after(0, lambda: self._finish_trash_batch(
+                paths, trashed_paths, failures, processed, cancelled))
+        except Exception:
+            pass
 
-        # Remove only successfully trashed photo cards; failed cards remain
-        # checked so the user can inspect or retry them.
-        for path in paths:
-            if path in trashed_paths:
-                card = self.card_frames.pop(path, None)
-                if card is not None:
-                    card.destroy()
-                self.trash_vars.pop(path, None)
-        remaining_groups, remaining_frames = [], []
-        for group, frame in zip(self.clusters, self.group_frames):
-            remaining = [rec for rec in group if rec["path"] not in trashed_paths]
-            if remaining:
-                frame.config(text=f"{len(remaining)} similar photos")
-                for index, card in enumerate(frame.winfo_children()):
-                    card.grid_configure(row=index // 4, column=index % 4)
-                remaining_groups.append(remaining)
-                remaining_frames.append(frame)
-            else:
-                frame.destroy()
-        self.clusters = remaining_groups
-        self.group_frames = remaining_frames
+    def _update_trash_progress(self, processed, sent, total):
+        if self.trash_progress_win is None or not self.trash_progress_win.winfo_exists():
+            return
+        self.trash_progress_bar.configure(value=processed)
+        self.trash_progress_label.config(
+            text=f"Processed {processed} of {total} files · sent {sent} to the Recycle Bin…")
 
-        msg = f"Sent {len(trashed_paths)} file(s) to the Recycle Bin."
+    def _finish_trash_batch(self, paths, trashed_paths, failures, processed, cancelled):
+        if self.trash_progress_win is not None:
+            try:
+                self.trash_progress_win.destroy()
+            except Exception:
+                pass
+        self.trash_progress_win = None
+        self.trash_progress_label = None
+        self.trash_progress_bar = None
+        self.trash_worker = None
+        self.btn_trash.config(state=tk.NORMAL)
+        self.btn_select_all.config(state=tk.NORMAL)
+        self.btn_scan.config(state=tk.NORMAL)
+
+        # Remove successful files from the results; failures and cancelled files
+        # remain selected so the user can retry or adjust the selection.
+        self.selected_paths.difference_update(trashed_paths)
+        self.clusters = [[rec for rec in group if rec["path"] not in trashed_paths]
+                         for group in self.clusters]
+        self.clusters = [group for group in self.clusters if len(group) > 1]
+        visible_paths = {rec["path"] for group in self.clusters for rec in group}
+        self.selected_paths.intersection_update(visible_paths)
+        self._build_group_list(open_first=False)
+
+        msg = f"Sent {len(trashed_paths)} of {len(paths)} files to the Recycle Bin."
+        if cancelled:
+            msg += f" Stopped after {processed}; remaining files were left untouched."
         if failures:
             msg += f" {len(failures)} failed; see the error details."
-        self.lbl_stat.config(text=msg, fg="green" if not failures else "orange")
+        self.lbl_stat.config(text=msg, fg="orange" if cancelled or failures else "green")
         if failures:
             details = "\n\n".join(f"{path}\n  {error}" for path, error in failures[:8])
             if len(failures) > 8:
                 details += f"\n\n…and {len(failures) - 8} more failure(s)."
             messagebox.showwarning("Could not send files to the Recycle Bin", details)
+        if self._close_after_trash:
+            self._close_after_trash = False
+            self.close()
+
+    def close(self):
+        if self.trash_worker is not None and self.trash_worker.is_alive():
+            self._close_after_trash = True
+            self._request_trash_cancel()
+            self.lbl_stat.config(text="Closing after the current file finishes…", fg="orange")
+            return
+        self.thumbnail_pool.shutdown(wait=False, cancel_futures=True)
+        save_cache(self.cache)
+        self.root.destroy()
 
 
 def _fmt_size(n):
@@ -901,6 +1355,6 @@ if __name__ == "__main__":
         except Exception:
             pass
         sys.exit(1)
-    # Persist the hash cache on close so the next run starts warm.
-    root.protocol("WM_DELETE_WINDOW", lambda: (save_cache(app.cache), root.destroy()))
+    # Persist the cache and stop queued thumbnail work on close.
+    root.protocol("WM_DELETE_WINDOW", app.close)
     root.mainloop()
